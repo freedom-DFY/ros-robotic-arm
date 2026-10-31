@@ -1,0 +1,35 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+
+# Local original archives, CAD files and reference material.
+/reference/
+
+# Local editor settings, code index databases and agent configuration.
+/.vscode/
+/.agents/
+/.aws/
+/.codex/
+
+# Compiled SDK libraries and binaries.
+*.o
+*.a
+*.so
+*.so.*
+*.dll
+*.lib
+*.exe
+.DS_Store
+.vs/
+*.suo
+*.vc.db
+*.vc.db-*
+
+# Local credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key

@@ -1,0 +1,25 @@
+/**:
+  ros__parameters:
+    motor_ids: [1, 2, 3, 4, 5]
+    # 单圈模式硬件范围。按实际机械限位进一步收紧这两组值。
+    position_min: [0, 0, 0, 0, 0]
+    position_max: [4095, 4095, 4095, 4095, 4095]
+    initial_position: [2048, 2160, 1910, 1360, 2048]
+
+sync_read_write_node:
+  ros__parameters:
+    device_name: /dev/ttyUSB0
+    baud_rate: 1000000
+    dry_run: false
+    publish_rate: 50.0
+    profile_acceleration: 500
+    profile_velocity: 1000
+    disable_torque_on_shutdown: true
+
+logicool_controller:
+  ros__parameters:
+    link_a2_mm: 246.06
+    link_a3_mm: 242.25
+    tool_length_mm: 255.55
+    cartesian_step_mm: 10.0
+    joy_layout: sdl
