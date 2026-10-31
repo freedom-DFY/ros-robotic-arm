@@ -1,0 +1,121 @@
+# XH430-W350 双电机（ID 4、5）ROS 2 实机命令
+# Ubuntu 24.04 / ROS 2 Jazzy。
+# 用户截图：ID 4，型号 XH430-W350，Model Number=1000，Protocol 2.0，波特率=1000000。
+# 图中 Drive Mode=4（时间型曲线），Operating Mode=3（单圈位置控制）。
+# 下列命令会检查两台电机型号均为 1000；若 ID 5 不同型号，会停止，不写控制参数。
+# 官方型号手册：https://emanual.robotis.com/docs/en/dxl/x/xh430-w350/
+# COM5 是 Windows 下的名称，Ubuntu 必须使用实际的 /dev/ttyUSB* 或 /dev/ttyACM*。
+# 不要启动完整的 manipulator.launch.py，它要求五台电机全部在线。
+# 不要把本文件整体当脚本执行，按终端和步骤分别运行。
+
+
+# 1. 连接准备。
+# 关闭 DYNAMIXEL Wizard 或断开其串口连接，避免串口被同时占用。
+# 把同一个 USB 转接器接到 Ubuntu，保留电机所需的外部电源。
+# 如果 Ubuntu 是虚拟机，需要先把 USB 转接器分配给虚拟机。
+# 如果是 WSL，需要先完成 USB 设备附加，不能直接把 Windows COM5 填入此 Linux 节点。
+# 启动扭矩使能模式和退出节点时可能卸力，请支撑好有负载的机构。
+
+# 在 Ubuntu 查看实际串口。
+ls -l /dev/serial/by-id/
+ls -l /dev/ttyUSB* /dev/ttyACM*
+
+# 如果没有任何设备，先解决 USB 识别/虚拟机直通问题，再启动 ROS 2 串口节点。
+# 后面示例使用 /dev/ttyUSB0；如果查到其他名字，修改 MOTOR_PORT 这一行。
+
+
+# 2. 终端 1：编译最新节点并加载环境。
+cd /home/duziteng/ros-robotic-arm
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+colcon build --symlink-install --packages-select five_dof_arm
+source install/setup.bash
+
+# 设置实际的 Ubuntu 串口名；不能写 COM5。
+MOTOR_PORT=/dev/ttyUSB0
+
+
+# 3. 终端 1：先只读连接两台电机，不写模式、目标或扭矩寄存器。
+# dry_run=false 表示连接真实串口，enable_torque=false 表示只读取。
+# expected_model_number=1000 检查型号，防止误用不同控制表。
+ros2 run five_dof_arm motor_test_node --ros-args \
+  -p dry_run:=false -p enable_torque:=false \
+  -p "device_name:=$MOTOR_PORT" -p baud_rate:=1000000 \
+  -p 'motor_ids:=[4,5]' -p expected_model_number:=1000
+
+# 成功时会显示两个 ID 的 model number、Drive Mode、present position 和 READ ONLY。
+# 如果只接一台，可把 motor_ids 改成 [4] 或 [5]；ID 编号无需修改。
+
+
+# 4. 终端 2：查询当前编码位置。
+source /opt/ros/jazzy/setup.bash
+source /home/duziteng/ros-robotic-arm/install/setup.bash
+
+# 查询 ID 4。返回 position: -1 表示失败，不应作为运动目标。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 4}'
+
+# 查询 ID 5。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 5}'
+
+# 持续查看反馈，按 Ctrl+C 停止查看。
+ros2 topic echo /motor_test/position
+
+
+# 5. 终端 1：按 Ctrl+C 退出只读节点，然后开启位置控制。
+# 同时只运行一个使用此串口的节点。
+# 如果重开了终端，先执行两条 source，再重新设置 MOTOR_PORT。
+# 启动时设置单圈位置模式，读取实际位置并把它设为初始目标，然后使能扭矩。
+# 节点不会自动前往 2048，也不会使用完整机械臂的预设姿态。
+ros2 run five_dof_arm motor_test_node --ros-args \
+  -p dry_run:=false -p enable_torque:=true \
+  -p "device_name:=$MOTOR_PORT" -p baud_rate:=1000000 \
+  -p 'motor_ids:=[4,5]' -p expected_model_number:=1000 \
+  -p profile_duration_ms:=2000 -p profile_acceleration_time_ms:=500
+
+# 节点会逐台读取 Drive Mode，保留原来的曲线模式和方向：
+# 时间型模式（截图中的 4）：总时间 2000 ms、加速时间 500 ms。
+# 速度型模式：使用 profile_velocity=20、profile_acceleration=10 的寄存器数值。
+# 不会把 Drive Mode=4 下的 20 误解为低速；时间型模式下它实际表示 20 ms。
+# 正常退出本模式时，默认关闭这两台电机的扭矩。
+
+
+# 6. 终端 2：重新查询使能后的当前位置，再小幅发送目标。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 4}'
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 5}'
+
+# 下方 2080 仅举例：如果该电机刚查询到的位置是 2048，增加 32 刻度约为 2.81 度。
+# 若当前位置不是 2048，请把目标替换成实际当前位置附近的值，不能直接照抄 2080。
+# 目标必须在 0～4095 内，也必须符合实际机械行程；接近边界时改用减小目标。
+# 每条指令只操作指定 ID，不会要求另一台移动。
+
+# 示例：仅在 ID 4 当前为 2048 且行程允许时，向 2080 小幅移动。
+ros2 topic pub --once /motor_test/set_position \
+  dynamixel_sdk_custom_interfaces/msg/SetPosition '{id: 4, position: 2080}'
+
+# 示例：仅在 ID 5 当前为 2048 且行程允许时，向 2080 小幅移动。
+ros2 topic pub --once /motor_test/set_position \
+  dynamixel_sdk_custom_interfaces/msg/SetPosition '{id: 5, position: 2080}'
+
+# 查看实际位置反馈；position 为绝对编码刻度，不是速度，也不是角度。
+ros2 topic echo /motor_test/position
+
+
+# 7. 常见问题。
+# READ ONLY：启动时 enable_torque=false，只读状态不会接受位置写入。
+# TIME OUT / There is no status packet：检查供电、线缆、1000000 波特率、ID、USB 设备归属。
+# 先确认官方软件已释放串口；用户截图中的 [ID:004] TIME OUT 也属于通信超时提示。
+# model ... expected 1000：检测到不同型号，先核对对应控制表，不要直接删除型号检查强行转动。
+# Cannot open：检查 MOTOR_PORT 路径及访问权限。
+
+# 仅在提示串口权限不足时执行，执行后注销并重新登录。
+sudo usermod -aG dialout "$USER"
+
+
+# 8. 可选：无硬件验证（与实机节点二选一）。
+# 此命令不打开串口，不让真实电机转动。
+ros2 run five_dof_arm motor_test_node --ros-args \
+  -p dry_run:=true -p 'motor_ids:=[4,5]'

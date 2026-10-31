@@ -49,6 +49,10 @@ sudo apt install build-essential cmake python3-colcon-common-extensions python3-
 
 ## 无硬件运行
 
+只有 ID 4、5 等部分电机时，可使用独立的 `motor_test_node`，无需启动完整机械臂控制器。
+具体命令见 [双电机_ID4_ID5命令行说明.txt](双电机_ID4_ID5命令行说明.txt)。该节点默认 `dry_run=true`；实机默认只读，需显式设置 `enable_torque=true` 才配置位置模式并使能扭矩。实机前必须核对电机型号、控制表、协议及波特率。
+用户提供的 ID 4 截图为 XH430-W350、型号编号 1000、Protocol 2.0、1000000 bps、Drive Mode=4。测试节点逐台读取 Drive Mode，时间型模式默认使用 2000 ms 总时间和 500 ms 加速时间，速度型模式使用原有 velocity/acceleration 参数；保留原曲线模式和方向。可通过 `expected_model_number:=1000` 核对两个 ID 的型号。Windows 的 COM5 在 Ubuntu 中需改为实际识别到的 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
+
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /home/duziteng/ros-robotic-arm/install/setup.bash

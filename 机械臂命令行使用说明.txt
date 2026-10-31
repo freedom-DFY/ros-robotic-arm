@@ -1,0 +1,242 @@
+# 五自由度机械臂命令行使用说明
+# 适用环境：Ubuntu 24.04 + ROS 2 Jazzy，使用 Bash 终端。
+# 工作空间：/home/duziteng/ros-robotic-arm
+# 仅连接 ID 4、5 时，请使用另一个文件“双电机_ID4_ID5命令行说明.txt”。
+# 本文件中的完整机械臂驱动要求配置的五个 ID 全部在线。
+# 请按需要分段复制命令，不要把整个文件作为脚本执行。
+# ros2 launch 和 ros2 topic echo 会持续运行，停止时按 Ctrl+C。
+# 同一套机械臂驱动只启动一次；切换运行方式前先关闭原来的 launch。
+# 本机已完成编译和 dry_run 测试，真实机械臂的通信、零位和动作尚未验证。
+
+
+# ============================================================
+# 1. 编译工作空间
+# ============================================================
+
+# 进入机械臂工作空间。
+cd /home/duziteng/ros-robotic-arm
+
+# 加载 ROS 2 Jazzy 基础环境。
+source /opt/ros/jazzy/setup.bash
+
+# 编译所有 ROS 2 包；--symlink-install 方便开发时使用源码中的资源。
+colcon build --symlink-install
+
+# 编译成功后，加载本工作空间的包、接口和可执行程序。
+source install/setup.bash
+
+# 后续只修改了 five_dof_arm 的 C++ 代码时，可单独编译该包。
+# 执行前需要已经完整编译过工作空间，并加载过工作空间环境。
+colcon build --symlink-install --packages-select five_dof_arm
+
+
+# ============================================================
+# 2. 每打开一个新终端，先加载环境
+# ============================================================
+
+# 终端 1、终端 2、终端 3 都需要分别执行下面两条命令。
+source /opt/ros/jazzy/setup.bash
+source /home/duziteng/ros-robotic-arm/install/setup.bash
+
+# 本项目使用 ROS 2，无需执行 roscore 或 catkin_make。
+
+
+# ============================================================
+# 3. 无硬件试运行：在终端 1 执行
+# ============================================================
+
+# dry_run:=true：不打开串口，不驱动实际舵机。
+# 启动驱动节点和控制器节点，并用模拟反馈验证话题、服务和运动学。
+# 此模式不提供三维机械臂模型、动力学仿真或碰撞检测。
+ros2 launch five_dof_arm manipulator.launch.py dry_run:=true
+
+# 保持终端 1 运行，后面的查询和发指令操作在其他终端进行。
+
+
+# ============================================================
+# 4. 查看节点、话题和反馈：在终端 2 执行
+# ============================================================
+
+# 新终端先执行第 2 节的两条 source 命令。
+
+# 查看正在运行的 ROS 2 节点。
+ros2 node list
+
+# 查看话题名称以及对应的消息类型。
+ros2 topic list -t
+
+# 持续查看五个关节状态；position 的单位为弧度。
+# 关节名 joint_1～joint_5 对应 motor_ids 中的五个舵机，顺序一致。
+# 按 Ctrl+C 结束查看，再执行下一条查询。
+ros2 topic echo /joint_states
+
+# 持续查看由正运动学计算的末端 XYZ 坐标，单位为毫米。
+ros2 topic echo /end_effector_position
+
+# 如只想读取一条末端坐标反馈，使用 --once。
+ros2 topic echo /end_effector_position --once
+
+# 查询五个舵机当前的位置编码刻度。
+# 返回 success: true 才表示读取成功；同时可查看 message 和 position1～position5。
+# 默认舵机 ID 为 1～5；若修改了配置，需同步修改这里的 ID。
+ros2 service call /sync_get_position dynamixel_sdk_custom_interfaces/srv/SyncGetPosition \
+  '{id1: 1, id2: 2, id3: 3, id4: 4, id5: 5}'
+
+
+# ============================================================
+# 5. 直接发送五关节位置：在终端 2 或终端 3 执行
+# ============================================================
+
+# 建议先在第 3 节的 dry_run 模式下使用此命令。
+# --once：只发布一次指令，不持续重复发送。
+# id1 对应 position1，id2 对应 position2，依此类推。
+# position 是舵机编码刻度，不是角度，也不是毫米。
+# 默认编码范围为 0～4095；2048 为软件角度参考点，每 1024 刻度约为 90 度。
+# 实际还受到 arm.yaml 中 position_min / position_max 的限制。
+# 此命令发送原代码中的初始预设；实机执行会要求机械臂前往该姿态。
+ros2 topic pub --once /sync_set_position dynamixel_sdk_custom_interfaces/msg/SyncSetPosition \
+  '{id1: 1, id2: 2, id3: 3, id4: 4, id5: 5, position1: 2048, position2: 2160, position3: 1910, position4: 1360, position5: 2048}'
+
+# 可修改 position1～position5 来设置目标位置。
+# 必须提供配置中的五个 ID，不能重复；超限时整条指令会被拒绝。
+# 实机小幅试动前，先用第 4 节的服务查询当前位置，再仅小幅修改一个位置值。
+
+
+# ============================================================
+# 6. 输入末端 XYZ 坐标：在终端 2 或终端 3 执行
+# ============================================================
+
+# 先读取当前位置，便于选择附近的目标点。
+ros2 topic echo /end_effector_position --once
+
+# 以下是坐标指令格式示例：目标为基坐标系下的 (0, 250, 0)，单位为毫米。
+# 建议先在 dry_run 中试验，并根据上一条命令返回的坐标调整目标。
+# 示例坐标不保证在所有姿态下都可达；无有效逆解或超限时会输出拒绝提示。
+ros2 topic pub --once /auto_transform geometry_msgs/msg/Point \
+  '{x: 0.0, y: 250.0, z: 0.0}'
+
+# 控制器会计算逆运动学，再将结果转换为五个舵机的位置指令。
+# XYZ 输入保持工具相对径向平面的俯仰/滚转，允许底座偏航跟随目标。
+# 当前不提供任意六维位姿控制、轨迹规划或碰撞检测，末端路径不保证是直线。
+# 驱动超过 1 秒没有提供新关节状态时，控制器会等待新反馈，不发送 XYZ 或手柄指令。
+
+
+# ============================================================
+# 7. 手柄控制：先关闭原来的 launch，再在终端 1 执行
+# ============================================================
+
+# 如需查看已连接的手柄及设备编号，可先运行此命令。
+ros2 run joy joy_enumerate_devices
+
+# 启动无硬件测试和手柄节点；默认使用设备编号 0。
+# 使用 joy/game_controller_node 的 SDL 标准按键映射。
+ros2 launch five_dof_arm manipulator.launch.py dry_run:=true use_joy:=true
+
+# 如果有多个手柄，可改用指定编号。此命令与上一条二选一，不要同时启动。
+ros2 launch five_dof_arm manipulator.launch.py dry_run:=true use_joy:=true joy_device_id:=0
+
+# 默认进入“关节模式”。按一次 BACK 切换到“末端坐标模式”，再按一次切回。
+# 按住增量控制按键会持续发送指令；末端坐标模式的默认步长为每次 10 mm。
+#
+# 按键              关节模式                  末端坐标模式
+# BACK              切换模式                  切换模式
+# LT / RT           关节 1 减 / 加             RT：切割预设
+# LB / RB           关节 2 减 / 加             初始 / 工作预设
+# 十字键 上 / 下    关节 3 加 / 减             X 加 / 减
+# 十字键 左 / 右    关节 4 加 / 减             Y 加 / 减
+# X / B             关节 5 加 / 减             无
+# Y / A             初始 / 工作预设            Z 加 / 减
+# START             切割预设                  无
+#
+# 初始预设：[2048, 2160, 1910, 1360, 2048]，可通过 initial_position 修改。
+# 工作预设：[2048, 2048, 2048, 2048, 2048]。
+# 切割预设：[2048, 2240, 1480, 2910, 2048]。
+# 实机按预设按钮会执行相应目标位置，需先确认机械行程。
+
+
+# ============================================================
+# 8. 连接真实机械臂：先关闭 dry_run，再在终端 1 执行
+# ============================================================
+
+# 驱动适用前提：Dynamixel X 系列 / MX(2.0)，Protocol 2.0，单圈位置模式。
+# 其他型号需要先核对舵机控制表，不能直接假设地址相同。
+# 默认要求五个舵机 ID 为 1、2、3、4、5，波特率均为 1000000。
+# 先在 arm.yaml 中核对 ID、速度、加速度以及实际机械限位。
+# position_min / position_max 的默认 0～4095 只是编码范围，需要按机械行程收紧。
+
+# 查看实际串口设备；设备名可能是 ttyUSB0、ttyUSB1 等。
+ls -l /dev/ttyUSB*
+
+# 不使用手柄：启动实机驱动和控制器，可通过话题发送关节或 XYZ 指令。
+# 本命令未设置 dry_run:=true，会访问真实串口并使能舵机扭矩。
+ros2 launch five_dof_arm manipulator.launch.py \
+  device_name:=/dev/ttyUSB0 baud_rate:=1000000
+
+# 使用手柄：与上一条二选一，先停止上一套 launch 再执行。
+ros2 launch five_dof_arm manipulator.launch.py \
+  device_name:=/dev/ttyUSB0 baud_rate:=1000000 use_joy:=true
+
+# 启动时先关闭扭矩、设置模式和运动参数，读取实际位置后再使能扭矩。
+# 实机启动不会自动移动到 initial_position 中的预设位置。
+# 默认按 Ctrl+C 正常退出时会关闭扭矩，机械臂可能在重力下移动。
+# 请在启停时支撑好机械臂；软件退出不能代替独立的硬件急停。
+
+
+# ============================================================
+# 9. 串口权限问题：仅在提示权限不足时执行
+# ============================================================
+
+# 将当前用户加入 dialout 组，获得串口访问权限。
+# 执行后需要注销桌面会话并重新登录，再打开终端、加载环境和启动程序。
+sudo usermod -aG dialout "$USER"
+
+# 重新登录后，检查当前用户所属组中是否包含 dialout。
+groups
+
+
+# ============================================================
+# 10. 配置文件和自定义配置
+# ============================================================
+
+# 查看当前配置，不修改文件。
+cat /home/duziteng/ros-robotic-arm/src/five_dof_arm/config/arm.yaml
+
+# 主要参数：
+# motor_ids：五个关节对应的舵机 ID，顺序对应 joint_1～joint_5。
+# position_min / position_max：每个关节允许的最小 / 最大编码刻度。
+# initial_position：dry_run 初始状态，以及手柄中的初始预设。
+# profile_velocity / profile_acceleration：舵机运动参数，沿用舵机寄存器单位。
+# link_a2_mm / link_a3_mm / tool_length_mm：连杆和工具长度，单位为毫米。
+# cartesian_step_mm：手柄末端坐标模式的每次移动步长，默认 10.0 mm。
+# disable_torque_on_shutdown：正常退出时是否关闭扭矩，默认 true。
+#
+# 使用指定配置文件启动无硬件模式；也可将路径替换为自己的配置文件。
+# 注意：本命令也是一种 launch 启动方式，不能与其他 launch 同时重复运行。
+ros2 launch five_dof_arm manipulator.launch.py dry_run:=true \
+  config:=/home/duziteng/ros-robotic-arm/src/five_dof_arm/config/arm.yaml
+
+# launch 参数 dry_run / device_name / baud_rate / joy_layout 会覆盖 YAML 对应值。
+# 实机使用自定义串口和波特率时，请像第 8 节一样显式传入启动参数。
+# 修改启动参数或配置文件后，停止并重新启动节点使设置生效。
+
+
+# ============================================================
+# 11. 运行已有测试
+# ============================================================
+
+# 新终端先执行第 2 节的 source 命令，再进入工作空间。
+cd /home/duziteng/ros-robotic-arm
+
+# 运行机械臂运动学测试；测试不操作实际舵机。
+colcon test --packages-select five_dof_arm --event-handlers console_direct+
+
+# 查看测试结果，检查是否有 errors 或 failures。
+colcon test-result --verbose
+
+# 自动启动 dry_run 节点，检查话题、服务、手柄、限位和逆运动学。
+# 默认使用 ROS_DOMAIN_ID=73；测试结束后会关闭它启动的节点。
+# 此测试需要本机允许 ROS 2 DDS 的本地网络通信，不访问串口。
+python3 src/five_dof_arm/test/smoke_test.py
+
+
+# 更多代码结构、原始资料说明和操作细节，请参阅工作空间根目录的 README.md。
