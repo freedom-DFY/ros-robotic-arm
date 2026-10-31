@@ -1,0 +1,211 @@
+# 双电机完整实机操作流程：Ubuntu 24.04 + ROS 2 Jazzy
+# 电机：XH430-W350；ID：4、5；型号编号：1000；协议：2.0；波特率：1000000。
+# 两台电机通过同一总线依次连接，共用一个 USB 串口，分别按 ID 控制。
+# 已确认两台 Drive Mode=4，节点使用时间型曲线，总时间 2000 ms，加速时间 500 ms。
+# 全流程需要两个终端：终端 1 保持驱动运行，终端 2 查询位置和发送目标。
+# 请按步骤分段执行，不要将整份 TXT 当作脚本运行。
+# 每次启动后都要重新读取位置，不能把上一次测试的目标当作本次当前位置。
+
+
+# ============================================================
+# 第 1 步：连接硬件
+# ============================================================
+# 关闭 DYNAMIXEL Wizard 或断开它的连接，保证只有一个程序使用该串口。
+# 按原来已验证的方式连接 USB 转接器、电机线和电机外部电源。
+# 如果需要改变电机接线，先断开电机电源；启停驱动时支撑好有负载的机构。
+# 如果旧驱动还在运行，先在旧终端按 Ctrl+C 正常停止，避免重复启动占用串口。
+# Ubuntu 的串口名称是 /dev/ttyUSB* 等，不使用 Windows 的 COM5。
+
+
+# ============================================================
+# 第 2 步：终端 1，确认串口和权限
+# ============================================================
+
+# 找到实际串口，后面假设为 /dev/ttyUSB0。
+ls -l /dev/ttyUSB*
+
+# 若没有设备，先检查 USB 线和电脑接口；不要继续启动串口节点。
+# 如果实际是 /dev/ttyUSB1，需把后面启动命令里的路径改为 /dev/ttyUSB1。
+
+# 已加入 dialout 组但当前登录会话尚未更新时，单独执行下行命令。
+# newgrp 会进入一个新 Shell；等新的提示符出现后，再继续后面的步骤。
+newgrp dialout
+
+# 只有此前没有加入 dialout 组或仍提示 Permission denied 时，才执行以下两条。
+# sudo usermod -aG dialout "$USER"
+# newgrp dialout
+
+
+# ============================================================
+# 第 3 步：终端 1，加载环境并编译当前版本
+# ============================================================
+
+cd /home/duziteng/ros-robotic-arm
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+colcon build --symlink-install --packages-select five_dof_arm
+source install/setup.bash
+
+# 修改代码后需要重新编译；没有修改代码的日常使用可跳过 colcon build。
+# 每个新终端都需要加载 ROS 和工作空间环境。
+
+
+# ============================================================
+# 第 4 步：终端 1，启动两台电机的位置控制
+# ============================================================
+
+# 此命令访问真实电机并使能扭矩。当前连接已确认时按本步骤启动。
+# 若正在排查 USB 掉线，先把 enable_torque 改为 false，只读检查稳定性。
+# 同时只能运行一个使用该串口的驱动节点。
+ros2 run five_dof_arm motor_test_node --ros-args \
+  -p dry_run:=false \
+  -p enable_torque:=true \
+  -p device_name:=/dev/ttyUSB0 \
+  -p baud_rate:=1000000 \
+  -p 'motor_ids:=[4,5]' \
+  -p expected_model_number:=1000 \
+  -p profile_duration_ms:=2000 \
+  -p profile_acceleration_time_ms:=500 \
+  -p publish_rate:=1.0
+
+# 成功标志：Motor test ready: IDs=[4, 5], torque enabled
+# 节点会读取实际位置作为初始目标，再使能扭矩；不会自动前往旧目标或机械臂预设。
+# 看到成功标志后，终端 1 保持运行，不要关闭它。
+# 如果显示 READ ONLY，则当前只读，不能发送运动目标，需要停止后按上面命令重启。
+# 如果出现通信或型号错误，先处理错误，不继续后面的转动步骤。
+
+
+# ============================================================
+# 第 5 步：终端 2，加载环境，核对模式
+# ============================================================
+
+source /opt/ros/jazzy/setup.bash
+source /home/duziteng/ros-robotic-arm/install/setup.bash
+
+# 预期返回 Boolean value is: True。
+ros2 param get /motor_test_node enable_torque
+
+# 预期返回 Boolean value is: False。
+ros2 param get /motor_test_node dry_run
+
+# 参数反映节点的配置；电机是否实际执行，还需要结合驱动日志和位置反馈判断。
+
+
+# ============================================================
+# 第 6 步：终端 2，分别查询当前编码位置并记下结果
+# ============================================================
+
+# 查询 ID 4。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 4}'
+
+# 查询 ID 5。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 5}'
+
+# 正常应返回 position: 数值，范围为 0～4095；-1 表示读取失败。
+# 记录两台各自的起始值。关节被手动转动、驱动重启或电源重启后，需要重新查询。
+
+
+# ============================================================
+# 第 7 步：计算目标位置
+# ============================================================
+
+# 位置单位是绝对编码刻度，不是角度、速度或相对增量。
+# 单圈 4096 刻度约对应 360 度：16 刻度约 1.41 度，128 刻度约 11.25 度。
+# 本次使用 128 刻度作为示例，先确认机械机构在该方向有足够活动空间。
+# 编码目标必须位于 0～4095 内，同时符合实际机械行程；编码合法不代表不会撞限位。
+#
+# 计算方法：新目标 = 刚查询到的实际位置 + 128。
+# 反方向则为：新目标 = 刚查询到的实际位置 - 128。
+#
+# 例如刚查询到 ID 4 为 2427，则正方向测试目标为 2427+128=2555。
+# 例如刚查询到 ID 5 为 3602，则正方向测试目标为 3602+128=3730。
+# 以下运动命令只适用于这些示例起点；实际读数不同时，必须重新计算并替换目标。
+
+
+# ============================================================
+# 第 8 步：终端 2，先测试 ID 4，再确认反馈
+# ============================================================
+
+# 仅当本轮刚读到 ID 4 的位置为 2427，且行程允许时，执行此示例。
+# --once 表示只发布一次；只要求 ID 4 转动，不改变 ID 5 的目标。
+ros2 topic pub --once /motor_test/set_position \
+  dynamixel_sdk_custom_interfaces/msg/SetPosition '{id: 4, position: 2555}'
+
+# 等待约 3 秒，观察动作后再运行下面的查询。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 4}'
+
+# publishing #1 说明发送端已发布消息；终端 1 应同时显示 ID 4: goal position 2555。
+# 该驱动日志表示目标写入请求成功，是否到位需要与实际位置反馈核对。
+# 如果反馈持续停在目标之外，请记录目标、反馈和终端 1 日志，进一步排查。
+
+
+# ============================================================
+# 第 9 步：终端 2，ID 4 正常后，再测试 ID 5
+# ============================================================
+
+# 先重新查询 ID 5，确保本轮起点仍与下面示例一致。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 5}'
+
+# 仅当本轮刚读到 ID 5 的位置为 3602，且行程允许时，执行此示例。
+ros2 topic pub --once /motor_test/set_position \
+  dynamixel_sdk_custom_interfaces/msg/SetPosition '{id: 5, position: 3730}'
+
+# 等待约 3 秒，观察动作后再查询。
+ros2 service call /motor_test/get_position \
+  dynamixel_sdk_custom_interfaces/srv/GetPosition '{id: 5}'
+
+# 重复发送同一个绝对目标不会继续增加角度。
+# 如需继续转动，重新读取当前位置，再计算新的目标。
+# 如需返回测试起点，将目标设为本轮测试前实际记录的起始位置，并确认返回路径可行。
+
+
+# ============================================================
+# 第 10 步：终端 2，持续观察两个电机的位置
+# ============================================================
+
+ros2 topic echo /motor_test/position
+
+# 输出交替显示 id: 4 和 id: 5，以及各自的 position。
+# 在终端 2 按 Ctrl+C，只会停止本次 echo，不会停止终端 1 的驱动。
+
+
+# ============================================================
+# 第 11 步：正常停止
+# ============================================================
+
+# 先支撑好有负载的机构，再到终端 1 按 Ctrl+C 正常停止节点。
+# 默认会尝试关闭两台电机的扭矩，然后关闭串口；不要依赖断开 USB 来关闭扭矩。
+# 确认机构稳定后再按需要关闭电机电源。下次启动从第 2 步开始重新确认设备和位置。
+
+
+# ============================================================
+# 第 12 步：遇到错误时的处理
+# ============================================================
+
+# The passed message type is invalid：在报错的那个终端重新加载环境。
+source /opt/ros/jazzy/setup.bash
+source /home/duziteng/ros-robotic-arm/install/setup.bash
+
+# waiting for service to become available：刚启动时短暂等待可能是发现过程。
+# 如果一直等待，检查终端 1 是否仍在运行，以及两个终端是否都加载了工作空间环境。
+
+# Permission denied：按第 2 步处理 dialout 权限。
+# READ ONLY：按第 4 步重新启动 enable_torque=true 的节点。
+# TIME OUT / There is no status packet：检查供电、ID、波特率、线缆和串口占用。
+# Input/output error / Serial link failed：停止旧节点，检查 USB 数据线和电脑接口。
+# 本机之前记录过 USB disconnect 和 disabled by hub (EMI?)，需排除实际 USB 掉线。
+# 节点遇到串口硬错误会停止轮询和运动写入；修好连接后必须手动重启节点。
+# 掉线时电机扭矩可能仍然使能，软件无法保证已关闭，需要支撑机构并检查设备状态。
+
+# 查看最近 USB 内核日志。
+journalctl -k -n 100 --no-pager | rg -i 'usb|ftdi|ttyUSB|disconnect|reset'
+
+# 检查设备是否仍存在；重新连接后可能变成 ttyUSB1，启动时要使用实际路径。
+ls -l /dev/ttyUSB*
+
+# 查看串口占用情况，只检查，不终止任何程序。
+fuser -v /dev/ttyUSB0

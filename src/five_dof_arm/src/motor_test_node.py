@@ -7,6 +7,11 @@ from dynamixel_sdk_custom_interfaces.msg import SetPosition
 from dynamixel_sdk_custom_interfaces.srv import GetPosition
 import rclpy
 from rclpy.node import Node
+from serial import SerialException
+
+
+class SerialLinkError(RuntimeError):
+    """The USB serial connection requires operator inspection and restart."""
 
 
 class MotorTestNode(Node):
@@ -43,25 +48,28 @@ class MotorTestNode(Node):
         self.packet = None
         self.opened = False
         self.enabled_ids = []
+        self.port_error = None
+        self.timer = None
         try:
             if not self.dry_run:
                 self.port = PortHandler(self.device)
                 self.packet = PacketHandler(2.0)
-                if not self.port.openPort():
+                if not self.sdk_call(self.port.openPort):
                     raise RuntimeError('Cannot open ' + self.device)
                 self.opened = True
-                if not self.port.setBaudRate(self.baud):
+                if not self.sdk_call(self.port.setBaudRate, self.baud):
                     raise RuntimeError('Cannot set baud rate')
                 # Ping every requested ID before making any configuration writes.
                 for motor_id in self.ids:
-                    model, result, error = self.packet.ping(self.port, motor_id)
+                    model, result, error = self.sdk_call(self.packet.ping, self.port, motor_id)
                     self.check(result, error, motor_id)
                     if self.expected_model and model != self.expected_model:
                         raise RuntimeError(f'ID {motor_id}: model {model}, expected {self.expected_model}')
                     self.get_logger().info(f'ID {motor_id}: model number {model}')
                 drive_modes = {}
                 for motor_id in self.ids:
-                    drive_mode, result, error = self.packet.read1ByteTxRx(self.port, motor_id, 10)
+                    drive_mode, result, error = self.sdk_call(
+                        self.packet.read1ByteTxRx, self.port, motor_id, 10)
                     self.check(result, error, motor_id)
                     drive_modes[motor_id] = drive_mode
                     units = 'time-based (ms)' if drive_mode & 4 else 'velocity-based'
@@ -106,6 +114,28 @@ class MotorTestNode(Node):
         mode = 'dry_run' if self.dry_run else ('torque enabled' if self.enable_torque else 'READ ONLY')
         self.get_logger().info(f'Motor test ready: IDs={self.ids}, {mode}')
 
+    def sdk_call(self, method, *args):
+        if self.port_error:
+            raise SerialLinkError(self.port_error)
+        try:
+            return method(*args)
+        except (OSError, SerialException) as error:
+            # A serial exception can leave the SDK's port-busy flag set.
+            # Latch the fault instead of resending commands or re-enabling torque.
+            self.port.is_using = False
+            self.port_error = (
+                f'Serial link failed on {self.device}: {error}. '
+                'Polling and motor commands stopped; check USB/power/cables, '
+                'then restart this node after reconnecting the device.')
+            if self.timer is not None:
+                self.timer.cancel()
+            self.get_logger().error(self.port_error)
+            if self.enabled_ids:
+                self.get_logger().warning(
+                    'Connection lost: motor torque may remain enabled; '
+                    'torque shutdown cannot be confirmed over the failed link.')
+            raise SerialLinkError(self.port_error) from error
+
     def check(self, result, error, motor_id):
         if result != COMM_SUCCESS:
             raise RuntimeError(f'ID {motor_id}: {self.packet.getTxRxResult(result)}')
@@ -114,16 +144,20 @@ class MotorTestNode(Node):
 
     def write(self, motor_id, address, value, one_byte=False):
         method = self.packet.write1ByteTxRx if one_byte else self.packet.write4ByteTxRx
-        result, error = method(self.port, motor_id, address, value)
+        result, error = self.sdk_call(method, self.port, motor_id, address, value)
         self.check(result, error, motor_id)
 
     def read(self, motor_id):
-        position, result, error = self.packet.read4ByteTxRx(self.port, motor_id, 132)
+        position, result, error = self.sdk_call(
+            self.packet.read4ByteTxRx, self.port, motor_id, 132)
         self.check(result, error, motor_id)
         # Present Position is signed in the device control table.
         return position if position < 0x80000000 else position - 0x100000000
 
     def set_position(self, msg):
+        if self.port_error:
+            self.get_logger().error(self.port_error)
+            return
         if msg.id not in self.ids:
             self.get_logger().error(f'Rejected ID {msg.id}: configured IDs are {self.ids}')
             return
@@ -158,12 +192,16 @@ class MotorTestNode(Node):
         return response
 
     def publish_positions(self):
+        if self.port_error:
+            return
         for motor_id in self.ids:
             try:
                 position = self.positions[motor_id] if self.dry_run else self.read(motor_id)
                 msg = SetPosition()
                 msg.id, msg.position = motor_id, position
                 self.publisher.publish(msg)
+            except SerialLinkError:
+                return
             except RuntimeError as error:
                 self.get_logger().error(str(error), throttle_duration_sec=2.0)
 
@@ -176,8 +214,12 @@ class MotorTestNode(Node):
                     self.write(motor_id, 64, 0, one_byte=True)
                 except RuntimeError as error:
                     self.get_logger().error(f'Torque disable failed: {error}')
-        self.port.closePort()
-        self.opened = False
+        try:
+            self.port.closePort()
+        except (OSError, SerialException) as error:
+            self.get_logger().error(f'Serial port close failed: {error}')
+        finally:
+            self.opened = False
 
 
 def main():

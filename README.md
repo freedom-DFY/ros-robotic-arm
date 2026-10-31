@@ -52,6 +52,7 @@ sudo apt install build-essential cmake python3-colcon-common-extensions python3-
 只有 ID 4、5 等部分电机时，可使用独立的 `motor_test_node`，无需启动完整机械臂控制器。
 具体命令见 [双电机_ID4_ID5命令行说明.txt](双电机_ID4_ID5命令行说明.txt)。该节点默认 `dry_run=true`；实机默认只读，需显式设置 `enable_torque=true` 才配置位置模式并使能扭矩。实机前必须核对电机型号、控制表、协议及波特率。
 用户提供的 ID 4 截图为 XH430-W350、型号编号 1000、Protocol 2.0、1000000 bps、Drive Mode=4。测试节点逐台读取 Drive Mode，时间型模式默认使用 2000 ms 总时间和 500 ms 加速时间，速度型模式使用原有 velocity/acceleration 参数；保留原曲线模式和方向。可通过 `expected_model_number:=1000` 核对两个 ID 的型号。Windows 的 COM5 在 Ubuntu 中需改为实际识别到的 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
+两台电机可串接在同一通信总线上，共用串口并通过不同 ID 分别访问。`motor_test_node` 遇到 USB 串口 I/O 异常时会停止轮询和运动写入，查询返回 -1，不自动重连或恢复运动；连接修复后需手动重启。若掉线前扭矩已使能，软件无法确认已关闭扭矩。普通状态包超时会跳过该次反馈并允许后续读取恢复；具体 USB 排查命令见双电机说明。
 
 ```bash
 source /opt/ros/jazzy/setup.bash

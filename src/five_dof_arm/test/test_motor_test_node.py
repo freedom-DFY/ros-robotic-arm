@@ -154,6 +154,60 @@ class MotorTest(unittest.TestCase):
         self.assertEqual(node.get_position(
             GetPosition.Request(id=4), GetPosition.Response()).position, 2060)
 
+    def test_usb_disconnect_stops_polling_and_never_publishes_stale_positions(self):
+        node = self.node()
+        self.packet.read4ByteTxRx.side_effect = OSError(5, 'Input/output error')
+        node.publish_positions()
+        self.assertIsNotNone(node.port_error)
+        node.timer.cancel.assert_called_once()
+        self.assertFalse(self.port.is_using)
+        node.publisher.publish.assert_not_called()
+        calls = self.packet.read4ByteTxRx.call_count
+        node.publish_positions()
+        self.assertEqual(self.packet.read4ByteTxRx.call_count, calls)
+        self.assertEqual(node.get_position(
+            GetPosition.Request(id=5), GetPosition.Response()).position, -1)
+        self.assertEqual(self.packet.read4ByteTxRx.call_count, calls)
+
+    def test_service_serial_exception_returns_failure_and_latches_link_fault(self):
+        node = self.node()
+        self.packet.read4ByteTxRx.side_effect = module.SerialException('device disconnected')
+        self.assertEqual(node.get_position(
+            GetPosition.Request(id=4), GetPosition.Response()).position, -1)
+        self.assertIsNotNone(node.port_error)
+        node.timer.cancel.assert_called_once()
+
+    def test_disconnected_write_is_not_retried_or_followed_by_other_motion(self):
+        self.params['enable_torque'] = True
+        node = self.node()
+        self.packet.write4ByteTxRx.reset_mock()
+        self.packet.write4ByteTxRx.side_effect = OSError(5, 'Input/output error')
+        node.set_position(SetPosition(id=4, position=2110))
+        node.set_position(SetPosition(id=5, position=2210))
+        self.packet.write4ByteTxRx.assert_called_once()
+        node.timer.cancel.assert_called_once()
+        self.assertIsNotNone(node.port_error)
+        node.get_logger().warning.assert_called_once()
+
+    def test_device_timeout_skips_feedback_but_can_recover_on_next_read(self):
+        node = self.node()
+        self.packet.read4ByteTxRx.side_effect = None
+        self.packet.read4ByteTxRx.return_value = (0, -3001, 0)
+        node.publish_positions()
+        node.publisher.publish.assert_not_called()
+        self.assertIsNone(node.port_error)
+        node.timer.cancel.assert_not_called()
+        self.packet.read4ByteTxRx.return_value = (2200, 0, 0)
+        node.publish_positions()
+        self.assertEqual(node.publisher.publish.call_count, 2)
+
+    def test_serial_close_failure_does_not_escape_cleanup(self):
+        node = self.node()
+        self.port.closePort.side_effect = OSError(5, 'Input/output error')
+        node.close()
+        self.assertFalse(node.opened)
+        node.get_logger().error.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

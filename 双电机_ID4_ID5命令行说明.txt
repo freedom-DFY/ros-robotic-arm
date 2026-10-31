@@ -7,6 +7,7 @@
 # COM5 是 Windows 下的名称，Ubuntu 必须使用实际的 /dev/ttyUSB* 或 /dev/ttyACM*。
 # 不要启动完整的 manipulator.launch.py，它要求五台电机全部在线。
 # 不要把本文件整体当脚本执行，按终端和步骤分别运行。
+# 两台电机可以通过电机线依次连接在同一总线上，共用一个 Ubuntu 串口，按 ID 4、5 分别控制。
 
 
 # 1. 连接准备。
@@ -110,6 +111,33 @@ ros2 topic echo /motor_test/position
 # 先确认官方软件已释放串口；用户截图中的 [ID:004] TIME OUT 也属于通信超时提示。
 # model ... expected 1000：检测到不同型号，先核对对应控制表，不要直接删除型号检查强行转动。
 # Cannot open：检查 MOTOR_PORT 路径及访问权限。
+# Input/output error：USB 串口链路可能已经断开，不是再次添加 dialout 权限即可解决。
+# 新版节点遇到串口 I/O 异常时停止轮询和位置写入，保留节点供诊断；查询返回 -1。
+# 不发布旧位置充当新反馈，不自动重新使能扭矩或重发运动目标；连接恢复后手动重启节点。
+# 若掉线时扭矩已使能，软件不能保证已关闭扭矩，需要支撑机构并检查设备状态。
+
+# 查看最近内核日志，检查是否出现 USB disconnect、disabled by hub 或 FTDI 错误。
+journalctl -k -n 100 --no-pager | rg -i 'usb|ftdi|ttyUSB|disconnect|reset'
+
+# 如果端口已经消失，先重新连接 USB 转接器，检查/更换 USB 数据线和电脑 USB 接口。
+# 若需要调整电机之间的接线，先断开电机电源，再按厂家接线方式重新连接。
+# 内核中的 disabled by hub (EMI?) 只是线索，不能仅凭该行断定具体硬件原因。
+# 接回后再次确认设备名；它可能由 ttyUSB0 变为 ttyUSB1。
+ls -l /dev/serial/by-id/
+ls -l /dev/ttyUSB*
+
+# 查看是否有其他程序占用串口，只检查，不终止任何程序。
+fuser -v /dev/ttyUSB0
+
+# 恢复连接后，停止旧节点，在终端 1 用实际串口路径重新启动只读诊断。
+# 1 Hz 仅用于低频观察，不代表 USB 掉线问题已修复。
+ros2 run five_dof_arm motor_test_node --ros-args \
+  -p dry_run:=false -p enable_torque:=false \
+  -p device_name:=/dev/ttyUSB0 -p baud_rate:=1000000 \
+  -p 'motor_ids:=[4,5]' -p expected_model_number:=1000 -p publish_rate:=1.0
+
+# 若需仅查询某一台，可停止当前节点后将上面 motor_ids 改为 [4] 或 [5]。
+# 不要同时开启两个节点抢占同一串口。先保证只读通信稳定，再开启位置控制。
 
 # 仅在提示串口权限不足时执行，执行后注销并重新登录。
 sudo usermod -aG dialout "$USER"
