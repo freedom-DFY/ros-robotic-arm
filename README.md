@@ -3,6 +3,12 @@
 已将参考代码中的五舵机同步读写、Logitech 手柄控制、末端 XYZ 输入迁移为 ROS 2 C++ 节点，使用 `ament_cmake` 和 `colcon` 编译。
 Ubuntu 24.04 是 [ROS 2 Jazzy 的官方支持平台](https://www.openrobotics.org/blog/2024/5/ros-jazzy-jalisco-released)。
 
+只调试前三个电机（ID 1、2、3）时，使用 [arm3_ros2](src/arm3_ros2/README.md)，支持三轴关节点动、腕点 XYZ 直线路径和手动使能。操作命令见 [前三电机_ID1_ID2_ID3_ROS2命令行说明.txt](前三电机_ID1_ID2_ID3_ROS2命令行说明.txt)。旧三轴 ROS 1 源码目录已删除。
+
+当前三轴实机测试采用 **固定起点 → 到位稳定 → 20 cm 直线**，直接查看 [20 cm 实机操作命令](calibration/arm3_horizontal_up_20cm/执行20cm实机命令.txt)。配置、路径和反馈记录统一保存在 [calibration](calibration/README.md)。
+
+新增后三轴的设计与实施顺序见 [六轴机械臂扩展设计](六轴机械臂扩展设计.md)，覆盖机械建模、六轴通信、初始使能保持、MoveIt/ros2_control 集成及分阶段验收。该文件为后续设计，当前控制程序仍按各自的三轴或五轴模型运行。
+
 ## 工作空间
 
 ```text
@@ -16,6 +22,12 @@ src/
     src/logicool_controller.cpp       # 手柄、正逆运动学、XYZ 输入
     config/arm.yaml                   # ID、限位、初始姿态、机械臂尺寸
     launch/manipulator.launch.py
+  arm3_ros2/                        # 独立三轴 ROS 2 Python 包，默认无硬件模式
+    arm3_ros2/node.py
+    config/arm3.yaml
+    launch/arm3.launch.py
+calibration/
+  arm3_horizontal_up_20cm/          # 当前固定起点、实机配置、路径与命令
 reference/                           # 仅本地保留，不提交到 GitHub
 ```
 

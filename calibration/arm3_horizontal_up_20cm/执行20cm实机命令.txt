@@ -1,0 +1,53 @@
+# 真实电机：低速回固定起点，稳定后沿 arm3_reference 的 -Y 水平直移 20 cm。
+# 2026-11-13按关节角度限制.docx更新限位；此前仅确认过20cm路径区域。
+# 当前运动范围：ID1 0~4095；ID2 740~2700；ID3 1047~3347。
+# ID2文档物理上限3323，但本次采用建议上限2700，也满足收缩时2809上限。
+# 固定起点为[3923,1061,2105]，参考零位仍为[3819,989,2013]，二者不同。
+# 使能后由程序低速返回起点，无需手工摆到起点。
+# 分终端按顺序操作，不要整份当作脚本执行。
+
+# 1. 终端2：在旧节点保持姿态时，先编译新命令。
+cd /home/duziteng/ros-robotic-arm
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install --packages-select arm3_ros2
+source install/setup.bash
+
+# 2. 终端1：可靠支撑当前姿态，Ctrl+C停止旧arm3节点。
+# 正常退出会卸掉扭矩，支撑到新节点成功使能。
+source /opt/ros/jazzy/setup.bash
+source /home/duziteng/ros-robotic-arm/install/setup.bash
+ros2 launch arm3_ros2 arm3.launch.py dry_run:=false \
+  device:=/dev/ttyUSB0 baud_rate:=1000000 \
+  config:=/home/duziteng/ros-robotic-arm/calibration/arm3_horizontal_up_20cm/arm3_20cm_EXECUTE.yaml
+
+# 3. 终端2：手动使能。只有 success: true 才继续。
+# 使能只保持读到的位置，不检查软件工作空间或校准标记。
+# 型号、通信和舵机模式仍需正常；后续运动再检查软件限位与整段路径。
+ros2 service call /arm3/enable std_srvs/srv/SetBool '{data: true}'
+
+# 4. 终端2：此命令启动一次真实的两阶段流程。
+# 先检查当前位置和归位端点是否满足机械运行边界及舵机内部范围，并预检查后续20cm直线。
+# 第一段按关节空间低速插值回[3923,1061,2105]，不要求末端走直线。
+# 第一段可越过测试用软件窗口，不做笛卡尔逆解，但不能越过mechanical_*机械边界。
+# 各轴反馈误差<=10刻度、0.5秒内位置变化<=3刻度，才启动第二段。
+# 归位关节速度上限0.02 rad/s；第二段速度上限5 mm/s，预计约44秒。
+# 机械边界全程生效；到位稳定后额外启用软件测试窗口反馈检查。返回起点另需时间。
+ros2 service call /arm3/run_fixed_line std_srvs/srv/Trigger '{}'
+
+# 返回success:true表示流程已接受，不代表已经完成。
+# 状态依次为 moving_to_start -> settling_start -> line_motion -> settling_end -> completed。
+# 若未到位、反馈变化过大、通信故障、超限或每段超过120秒，后续运动不会继续。
+# 运行期间新目标和重复启动会被拒绝；stop会取消整个流程。
+# 每次固定目标终点为[3446,1076,2240]，反馈允许10刻度误差。
+
+# 5. 随时查询当前阶段（或去掉--once持续查看，Ctrl+C只退出查看）。
+ros2 topic echo --once /arm3/motion_status
+
+# completed后查看真实反馈，并以尺量腕点位移核验实物距离。
+ros2 topic echo --once /arm3/encoder_ticks
+
+# 中途软件停止并保持当前位置，同时取消尚未开始的下一段；不会自动续跑：
+ros2 service call /arm3/stop std_srvs/srv/Trigger '{}'
+
+# 结束前先可靠支撑，再关闭扭矩或退出主节点。
+ros2 service call /arm3/enable std_srvs/srv/SetBool '{data: false}'

@@ -1,0 +1,66 @@
+# REAL HARDWARE: limits updated from 关节角度限制.docx on 2026-11-13.
+# Only the recorded 20 cm trajectory's swept region has been confirmed.
+# After manual enable, call /arm3/run_fixed_line for return-to-start then the line.
+/**:
+  ros__parameters:
+    dry_run: false
+    device: /dev/ttyUSB0
+    baud_rate: 1000000
+    calibration_confirmed: true
+    base_frame: arm3_reference
+    motor_ids:
+    - 1
+    - 2
+    - 3
+    expected_model_number: 1120
+    zero_ticks:
+    - 3819
+    - 989
+    - 2013
+    joint_directions:
+    - 1
+    - -1
+    - -1
+    position_min_ticks:
+    - 0
+    - 740
+    - 1047
+    position_max_ticks:
+    - 4095
+    - 2700
+    - 3347
+    # ID1 has no reported mechanical stop; Mode 3 remains single-turn (0..4095).
+    # ID2 physical maximum is 3323, but the document recommends <=2700.
+    # The conservative 2700 cap also respects the folded-forearm maximum 2809.
+    # Separate mechanical bounds remain active on the return-to-start leg.
+    mechanical_min_ticks: [0, 740, 1047]
+    mechanical_max_ticks: [4095, 2700, 3347]
+    upper_arm_m: 0.24606
+    forearm_m: 0.24225
+    base_height_m: 0.0
+    dh_offsets_rad:
+    - 0.0
+    - 0.0
+    - 1.5707963267948966
+    dry_start_ticks:
+    - 3923
+    - 1061
+    - 2105
+    rate_hz: 30.0
+    joint_speed_rad_s: 0.02
+    cartesian_speed_m_s: 0.005
+    path_resolution_m: 0.001
+    max_path_joint_step_rad: 0.03
+    max_tracking_error_rad: 0.02
+    joy_joint_steps_ticks:
+    - 16
+    - 8
+    - 8
+    joy_cartesian_step_m: 0.01
+    profile_acceleration: 5
+    profile_velocity: 12
+    fixed_start_ticks: [3923, 1061, 2105]
+    fixed_line_delta_m: [0.0, -0.20, 0.0]
+    fixed_arrival_tolerance_ticks: 10
+    fixed_settle_time_s: 0.5
+    fixed_stage_timeout_s: 120.0

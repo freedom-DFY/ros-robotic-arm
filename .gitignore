@@ -6,6 +6,13 @@ __pycache__/
 
 # Local original archives, CAD files and reference material.
 /reference/
+# Local source snapshots; maintain current source and configs directly in Git.
+/*.zip
+/*.zip.sha256
+/src/*.zip
+# Original measurement document and hardware photo stay local.
+/关节角度限制.docx
+/机械臂图片.jpg
 
 # Local editor settings, code index databases and agent configuration.
 /.vscode/
