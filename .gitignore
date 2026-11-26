@@ -3,6 +3,8 @@ install/
 log/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
 
 # Local original archives, CAD files and reference material.
 /reference/
@@ -11,8 +13,8 @@ __pycache__/
 /*.zip.sha256
 /src/*.zip
 # Original measurement document and hardware photo stay local.
-/关节角度限制.docx
-/机械臂图片.jpg
+/docs/hardware/关节角度限制.docx
+/docs/hardware/机械臂图片.jpg
 
 # Local editor settings, code index databases and agent configuration.
 /.vscode/

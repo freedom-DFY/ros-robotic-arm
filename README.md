@@ -1,174 +1,47 @@
-# 五自由度机械臂：Ubuntu 24.04 / ROS 2 Jazzy
+# 六轴机械臂与独立末端夹爪 · ROS 2 Jazzy
 
-已将参考代码中的五舵机同步读写、Logitech 手柄控制、末端 XYZ 输入迁移为 ROS 2 C++ 节点，使用 `ament_cmake` 和 `colcon` 编译。
-Ubuntu 24.04 是 [ROS 2 Jazzy 的官方支持平台](https://www.openrobotics.org/blog/2024/5/ros-jazzy-jalisco-released)。
+本仓库只维护 `arm6_ros2` 实机控制包：六个旋转关节（ID1–6）加一个独立夹爪电机（ID7）。
+前三轴保留现有电机型号、编码零位、方向、限位与连杆几何；后三轴、DH 腕部结构及工具偏置暂用可替换假设。
 
-只调试前三个电机（ID 1、2、3）时，使用 [arm3_ros2](src/arm3_ros2/README.md)，支持三轴关节点动、腕点 XYZ 直线路径和手动使能。操作命令见 [前三电机_ID1_ID2_ID3_ROS2命令行说明.txt](前三电机_ID1_ID2_ID3_ROS2命令行说明.txt)。旧三轴 ROS 1 源码目录已删除。
+- [安装、配置与操作](src/arm6_ros2/README.md)
+- [代码阅读：每个文件的用途和调用关系](代码阅读.md)
+- [前三轴标定依据与暂定硬件](docs/hardware/README.md)
 
-当前三轴实机测试采用 **固定起点 → 到位稳定 → 20 cm 直线**，直接查看 [20 cm 实机操作命令](calibration/arm3_horizontal_up_20cm/执行20cm实机命令.txt)。配置、路径和反馈记录统一保存在 [calibration](calibration/README.md)。
+## 安装与启动
 
-新增后三轴的设计与实施顺序见 [六轴机械臂扩展设计](六轴机械臂扩展设计.md)，覆盖机械建模、六轴通信、初始使能保持、MoveIt/ros2_control 集成及分阶段验收。该文件为后续设计，当前控制程序仍按各自的三轴或五轴模型运行。
+在工作空间根目录执行：
 
-## 工作空间
+```bash
+source /opt/ros/jazzy/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --packages-select arm6_ros2 --symlink-install
+source install/setup.bash
+ros2 launch arm6_ros2 arm6.launch.py device:=/dev/ttyUSB0 baud_rate:=1000000
+```
+
+DYNAMIXEL SDK 使用系统依赖 `ros-jazzy-dynamixel-sdk`，仓库不再包含上游多语言源码和示例。
+当前机器若未安装 SDK，先运行上述 `rosdep install`；也可执行：
+
+```bash
+sudo apt install ros-jazzy-dynamixel-sdk
+```
+
+启动后只读七个电机的反馈，不自动上扭矩。确认电机状态后，在另一个已加载环境的终端手动使能：
+
+```bash
+ros2 service call /arm6/enable std_srvs/srv/SetBool '{data: true}'
+```
+
+使能会保持实测位置，不自动归零。真正运动前需在 `config/arm6.yaml` 中确认七电机标定；
+末端位姿运动还需确认 DH 和 TCP。当前暂定参数尚未完成六轴实机验证，不包含碰撞规划。
+
+## 目录
 
 ```text
-src/
-  DynamixelSDK-main/ros/
-    dynamixel_sdk/                    # ROS 2 SDK；保留原有目录，方便 IDE 使用
-    dynamixel_sdk_custom_interfaces/  # 增加五舵机同步消息/服务
-    dynamixel_sdk_examples/           # 上游 ROS 2 单舵机示例
-  five_dof_arm/
-    src/sync_read_write_node.cpp      # 串口驱动 / dry_run
-    src/logicool_controller.cpp       # 手柄、正逆运动学、XYZ 输入
-    config/arm.yaml                   # ID、限位、初始姿态、机械臂尺寸
-    launch/manipulator.launch.py
-  arm3_ros2/                        # 独立三轴 ROS 2 Python 包，默认无硬件模式
-    arm3_ros2/node.py
-    config/arm3.yaml
-    launch/arm3.launch.py
-calibration/
-  arm3_horizontal_up_20cm/          # 当前固定起点、实机配置、路径与命令
-reference/                           # 仅本地保留，不提交到 GitHub
+src/arm6_ros2/       唯一 ROS 包：实机控制、运动学、轨迹、配置、启动与测试
+代码阅读.md          按文件解释代码及阅读顺序
+docs/hardware/      前三轴标定依据与本地原始硬件资料
 ```
 
-已删除解压参考代码中的 ROS 1 `ros/` 目录（catkin 包、ROS 1 launch、全向轮/视频等无关节点及旧编译产物），清理了工作空间旧的 `build/install/log` 后重新编译。
-原始压缩包仍保存在原工作空间的 `reference/` 中，可用于查阅原代码；该目录不上传到 GitHub，克隆仓库不会包含这些资料。该目录有 `COLCON_IGNORE`，不参与编译。SDK 的 Protocol 1.0 支持是舵机通信协议，与 ROS 1 无关，予以保留。
-
-## 编译
-
-本机已有 Jazzy、编译工具和依赖，直接执行：
-
-```bash
-cd /home/duziteng/ros-robotic-arm
-source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-source install/setup.bash
-```
-
-若在另一台已经安装 Jazzy 的 Ubuntu 24.04 上缺少依赖，可先安装：
-
-```bash
-sudo apt update
-sudo apt install build-essential cmake python3-colcon-common-extensions python3-rosdep \
-  libeigen3-dev python3-yaml ros-jazzy-ament-cmake ros-jazzy-ament-cmake-python \
-  ros-jazzy-ament-cmake-gtest ros-jazzy-ament-lint-auto ros-jazzy-ament-lint-common \
-  ros-jazzy-rclcpp ros-jazzy-rclpy ros-jazzy-rosidl-default-generators \
-  ros-jazzy-sensor-msgs ros-jazzy-geometry-msgs ros-jazzy-joy ros-jazzy-launch-ros
-```
-
-也可在已完成 `rosdep init` 的机器上用 `rosdep install --from-paths src --ignore-src -r -y --rosdistro jazzy` 解析依赖。
-无需启动 `roscore`，无需使用 `catkin_make`。
-
-## 无硬件运行
-
-只有 ID 4、5 等部分电机时，可使用独立的 `motor_test_node`，无需启动完整机械臂控制器。
-具体命令见 [双电机_ID4_ID5命令行说明.txt](双电机_ID4_ID5命令行说明.txt)。该节点默认 `dry_run=true`；实机默认只读，需显式设置 `enable_torque=true` 才配置位置模式并使能扭矩。实机前必须核对电机型号、控制表、协议及波特率。
-用户提供的 ID 4 截图为 XH430-W350、型号编号 1000、Protocol 2.0、1000000 bps、Drive Mode=4。测试节点逐台读取 Drive Mode，时间型模式默认使用 2000 ms 总时间和 500 ms 加速时间，速度型模式使用原有 velocity/acceleration 参数；保留原曲线模式和方向。可通过 `expected_model_number:=1000` 核对两个 ID 的型号。Windows 的 COM5 在 Ubuntu 中需改为实际识别到的 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
-两台电机可串接在同一通信总线上，共用串口并通过不同 ID 分别访问。`motor_test_node` 遇到 USB 串口 I/O 异常时会停止轮询和运动写入，查询返回 -1，不自动重连或恢复运动；连接修复后需手动重启。若掉线前扭矩已使能，软件无法确认已关闭扭矩。普通状态包超时会跳过该次反馈并允许后续读取恢复；具体 USB 排查命令见双电机说明。
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/duziteng/ros-robotic-arm/install/setup.bash
-ros2 launch five_dof_arm manipulator.launch.py dry_run:=true
-```
-
-`dry_run` 不打开串口，使用初始姿态作为状态，并立即回显收到的位置指令，适合验证 ROS 通信与逆解；它不模拟动力学、碰撞或实际运动过程。
-另开终端，同样 source 后查看：
-
-```bash
-ros2 topic echo /joint_states
-ros2 topic echo /end_effector_position
-ros2 service call /sync_get_position dynamixel_sdk_custom_interfaces/srv/SyncGetPosition \
-  '{id1: 1, id2: 2, id3: 3, id4: 4, id5: 5}'
-```
-
-## 实机运行
-
-本驱动沿用原代码的 **Dynamixel X 系列 / MX(2.0)、Protocol 2.0、单圈位置模式**，地址为扭矩使能 64、目标位置 116、当前位置 132。其他型号需先核对控制表。
-默认舵机 ID 为 1–5，波特率为 1000000，串口为 `/dev/ttyUSB0`。这五个 ID 对应五个机械关节。
-
-```bash
-ros2 launch five_dof_arm manipulator.launch.py \
-  device_name:=/dev/ttyUSB0 baud_rate:=1000000
-```
-
-启动时先关闭扭矩，设置位置模式与速度/加速度，读取实际位置并写入同一目标，再使能扭矩；不会自动前往预设姿态。
-默认退出时关闭扭矩，机械臂可能在重力下移动，启停时应支撑好机械臂；如需保留扭矩，可在 `arm.yaml` 中设置 `disable_torque_on_shutdown: false`。
-默认限位 0–4095 仅为单圈编码范围，使用前请在配置中按实际关节行程收紧 `position_min/position_max`。
-原代码的 profile 数值为加速度 500、速度 1000；可在配置中调低。
-
-若串口报权限错误，执行 `sudo usermod -aG dialout "$USER"` 后注销并重新登录；用 `ls -l /dev/ttyUSB*` 确认设备名。
-
-## 手柄操作
-
-```bash
-ros2 launch five_dof_arm manipulator.launch.py dry_run:=true use_joy:=true
-```
-
-实机手柄控制时去掉 `dry_run:=true`。默认启动 `joy/game_controller_node`，使用 SDL 标准映射，可通过 `joy_device_id:=0` 选择设备。
-设备列表可用 `ros2 run joy joy_enumerate_devices` 查看。标准映射依据 [joy 官方说明](https://github.com/ros-drivers/joystick_drivers/blob/ros2/joy/README.md)。
-
-| 按键 | 关节模式（默认） | 笛卡尔模式 |
-| --- | --- | --- |
-| BACK | 切换到笛卡尔模式 | 切换到关节模式 |
-| LT / RT | 关节 1 −16 / +16 刻度 | RT：切割预设 |
-| LB / RB | 关节 2 −8 / +8 刻度 | 初始 / 工作预设 |
-| 十字键上 / 下 | 关节 3 +8 / −8 刻度 | X +10 / −10 mm |
-| 十字键左 / 右 | 关节 4 +16 / −16 刻度 | Y +10 / −10 mm |
-| X / B | 关节 5 +16 / −16 刻度 | — |
-| Y / A | 初始 / 工作预设 | Z +10 / −10 mm |
-| START | 切割预设 | — |
-
-BACK 按下沿切换模式，长按不会重复切换。自动重发频率为 20 Hz，按住增量按键会持续发出位置指令。
-初始、工作、切割预设分别为 `[2048,2160,1910,1360,2048]`、`[2048,2048,2048,2048,2048]`、`[2048,2240,1480,2910,2048]`。
-
-若已有发布原始 Logitech DirectInput 布局（十字键为 axes[4:6]）的 ROS 2 Joy 节点，使用 `use_joy:=false joy_layout:=legacy`，由外部节点提供 `/joy`。
-`legacy` 不适用于内置的 SDL `game_controller_node`。
-
-## 位置指令和末端坐标
-
-五舵机同步位置指令（以下用于已启动的 dry_run 或实机驱动）：
-
-```bash
-ros2 topic pub --once /sync_set_position dynamixel_sdk_custom_interfaces/msg/SyncSetPosition \
-  '{id1: 1, id2: 2, id3: 3, id4: 4, id5: 5, position1: 2048, position2: 2160, position3: 1910, position4: 1360, position5: 2048}'
-```
-
-ID 必须是配置中的五个 ID，不能重复；允许按不同顺序给出 ID，位置与对应 ID 一一配对。超限时整条指令被拒绝。
-`/sync_get_position` 返回 `success`、`message` 及五个位置字段，失败时应检查 `success`，不能把默认零值当作实际读数。
-
-末端坐标输入保留原话题 `/auto_transform`，类型为 `geometry_msgs/msg/Point`，**单位为毫米**，坐标系沿用原始改进 DH 模型的基坐标系：
-
-```bash
-ros2 topic pub --once /auto_transform geometry_msgs/msg/Point '{x: 0.0, y: 250.0, z: 0.0}'
-```
-
-此命令格式可直接使用，但坐标是否可达取决于当前工具姿态及配置限位；可先读取 `/end_effector_position`，在其附近输入目标。
-XYZ 指令保持工具相对径向平面的俯仰/滚转，并允许底座偏航跟随目标，不提供任意六维位姿控制。
-逆解枚举底座/肘部解，校验完整正解，选择与当前关节位置最近且不超限的解；不可达或非有限数值输入会被拒绝。
-没有新鲜的驱动状态（超过 1 秒未收到 `/joint_states`）时，控制器不发送手柄或 XYZ 指令。
-
-机械参数沿用原资料：a2=246.06 mm、a3=242.25 mm、工具长=255.55 mm；原有 1.444 rad 安装偏置保留。
-`/joint_states` 中 `joint_1`–`joint_5` 表示相对舵机 2048 刻度的角度，单位为弧度；`/end_effector_position` 为模型计算的毫米坐标。
-当前没有新增 URDF、MoveIt、轨迹插补或碰撞检测；XYZ 是目标位置指令，TCP 路径不保证为直线。
-
-可编辑 `src/five_dof_arm/config/arm.yaml`，或通过 `config:=/绝对路径/arm.yaml` 提供配置。
-launch 参数 `dry_run/device_name/baud_rate/joy_layout` 始终覆盖 YAML 对应值；使用自定义串口、波特率时请显式传入这些参数。
-直接 `ros2 run five_dof_arm sync_read_write_node --ros-args --params-file /绝对路径/arm.yaml` 则使用 YAML 的值。
-
-## 验证
-
-```bash
-colcon test --packages-select five_dof_arm --event-handlers console_direct+
-colcon test-result --verbose
-python3 src/five_dof_arm/test/smoke_test.py
-```
-
-最后一条需已 source 工作空间，默认使用 ROS_DOMAIN_ID=73，自动启动并关闭 dry_run 节点。
-已验证 4 个包编译通过；6 项运动学测试通过（含 100 个随机姿态往返校验）；dry_run 联调验证了话题、服务、ID 顺序、限位、手柄、模式切换、XYZ 逆解及非法目标拒绝。
-尚未接入真实机械臂验证串口通信、舵机型号、机械零位及运动效果。
-
-## Git 仓库
-
-仓库只跟踪源码、配置和说明；`build/`、`install/`、`log/`、IDE 缓存、原始参考资料和本地凭据通过 `.gitignore` 排除。
-DynamixelSDK 保留上游许可证；本仓库代码采用 Apache-2.0 许可证，见 `LICENSE`。
+旧三轴/五轴控制器、手柄入口、历史轨迹、模拟运行分支、URDF 示意模型、模拟联调脚本、
+旧压缩包及构建产物已移除。保留的单元测试只注入假总线验证最终控制器，不提供模拟运行入口。
