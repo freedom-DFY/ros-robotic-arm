@@ -1,4 +1,4 @@
-"""Configurable standard-DH kinematics, encoder mapping and bounded pose IK."""
+"""Configurable Craig modified-DH kinematics, encoder mapping and bounded pose IK."""
 
 import math
 
@@ -67,10 +67,12 @@ def quaternion_from_matrix(rotation):
     return tuple(rotvec * (math.sin(angle / 2) / angle)) + (math.cos(angle / 2),)
 
 
-def dh_transform(a, d, alpha, theta):
-    c, s, ca, sa = math.cos(theta), math.sin(theta), math.cos(alpha), math.sin(alpha)
-    return np.array([[c, -s*ca, s*sa, a*c], [s, c*ca, -c*sa, a*s],
-                     [0, sa, ca, d], [0, 0, 0, 1]], dtype=float)
+def mdh_transform(a_prev, d, alpha_prev, theta):
+    """Rx(alpha[i-1]) Tx(a[i-1]) Rz(theta[i]) Tz(d[i]); joint i rotates about z_i."""
+    c, s = math.cos(theta), math.sin(theta)
+    ca, sa = math.cos(alpha_prev), math.sin(alpha_prev)
+    return np.array([[c, -s, 0, a_prev], [s*ca, c*ca, -sa, -d*sa],
+                     [s*sa, c*sa, ca, d*ca], [0, 0, 0, 1]], dtype=float)
 
 
 class ArmModel:
@@ -99,9 +101,9 @@ class ArmModel:
         ends = np.stack([(self.tick_min-self.zero)*self.sign*RADIANS_PER_TICK,
                          (self.tick_max-self.zero)*self.sign*RADIANS_PER_TICK])
         self.lower, self.upper = ends.min(axis=0), ends.max(axis=0)
-        self.a = vector(p['dh_a_m'], 6, 'dh_a_m')
+        self.a_prev = vector(p['dh_a_m'], 6, 'dh_a_m')
         self.d = vector(p['dh_d_m'], 6, 'dh_d_m')
-        self.alpha = vector(p['dh_alpha_rad'], 6, 'dh_alpha_rad')
+        self.alpha_prev = vector(p['dh_alpha_rad'], 6, 'dh_alpha_rad')
         self.offset = vector(p['dh_offsets_rad'], 6, 'dh_offsets_rad')
         self.tcp = np.eye(4)
         self.tcp[:3, 3] = vector(p['tcp_xyz_m'], 3, 'tcp_xyz_m')
@@ -138,10 +140,11 @@ class ArmModel:
         return tuple(int(t) for t in np.rint(ticks))
 
     def chain(self, joints):
+        """Base followed by six MDH frames; frame i's z axis is joint i's axis."""
         q = vector(joints, 6, 'arm joints')
         transforms = [np.eye(4)]
-        for a, d, alpha, theta in zip(self.a, self.d, self.alpha, q+self.offset):
-            transforms.append(transforms[-1] @ dh_transform(a, d, alpha, theta))
+        for a, d, alpha, theta in zip(self.a_prev, self.d, self.alpha_prev, q+self.offset):
+            transforms.append(transforms[-1] @ mdh_transform(a, d, alpha, theta))
         return transforms
 
     def forward(self, joints):
@@ -150,8 +153,10 @@ class ArmModel:
     def jacobian(self, joints):
         chain = self.chain(joints)
         end = (chain[-1] @ self.tcp)[:3, 3]
+        # Craig MDH joint i lies on z_i, after the fixed X transform and joint Z
+        # transform. Translation along that axis does not change its moment arm.
         return np.stack([np.r_[np.cross(t[:3, 2], end-t[:3, 3]), t[:3, 2]]
-                         for t in chain[:-1]], axis=1)
+                         for t in chain[1:]], axis=1)
 
     def inverse(self, target, seed):
         target = np.asarray(target, dtype=float)

@@ -15,22 +15,65 @@ from arm6_ros2.trajectory import Plan
 REFERENCE_TICKS = [3923, 1061, 2105, 2048, 2300, 2048, 2200]
 
 
-def test_first_three_axes_match_recorded_calibration_and_updated_link_fk():
-    model = ArmModel()
+def test_legacy_encoder_defaults_retained_pending_cad_alignment():
     assert DEFAULTS['zero_ticks'][:3] == [3819, 989, 2013]
     assert DEFAULTS['joint_directions'][:3] == [1, -1, -1]
     assert DEFAULTS['position_min_ticks'][:3] == [0, 740, 1047]
     assert DEFAULTS['position_max_ticks'][:3] == [4095, 2700, 3347]
     assert DEFAULTS['motor_ids'][:3] == [1, 2, 3]
     assert DEFAULTS['joint_velocity_limits_rad_s'][:3] == [0.02]*3
+    assert DEFAULTS['calibration_confirmed'] is False
+    assert DEFAULTS['geometry_confirmed'] is False
+
+
+def test_cad_saved_pose_matches_assembly_adapter_origin():
+    model = ArmModel()
+    # Independent assembly reference, in mm; allow 1 micrometre for rounded DH rows.
+    assert np.allclose(model.forward(np.zeros(6))[:3, 3] * 1000,
+                       [9.2073, 469.0624, 154.4533], atol=0.001, rtol=0)
+    assert np.allclose(model.tcp, np.eye(4))
+
+
+def test_cad_spherical_wrist_axes_and_adapter_distance():
+    model = ArmModel()
+    saved = model.chain(np.zeros(6))
+    assert np.allclose(saved[4][:3, 2], saved[6][:3, 2], atol=1e-12)
     random = np.random.default_rng(34)
     for _ in range(100):
-        joints = random.uniform(model.lower, model.upper)
-        t1, t2, t3 = joints[:3] + np.array([0, 0, math.pi/2])
-        radial = 0.170*math.cos(t2) + 0.170*math.cos(t2-t3)
-        expected = [radial*math.cos(t1), radial*math.sin(t1),
-                    -0.170*math.sin(t2)-0.170*math.sin(t2-t3)]
-        assert np.allclose(model.chain(joints)[3][:3, 3], expected, atol=1e-12)
+        chain = model.chain(random.uniform(model.lower, model.upper))
+        wrist = chain[4][:3, 3]
+        for index in (4, 5, 6):
+            # All three wrist axis lines pass through the same point.
+            assert np.linalg.norm(np.cross(wrist-chain[index][:3, 3],
+                                           chain[index][:3, 2])) < 1e-12
+        assert np.allclose(chain[6][:3, 3]-wrist, 0.0735*chain[6][:3, 2], atol=1e-12)
+
+
+@pytest.mark.parametrize('tool', [{}, {'tcp_xyz_m': [0.01, -0.02, 0.08],
+                                     'tcp_rpy_rad': [0.2, -0.1, 0.3]}])
+def test_modified_dh_matches_original_standard_cad_model(tool):
+    model = ArmModel(tool)
+    # Frozen original CAD standard-DH rows, independent of the new MDH defaults.
+    rows = [
+        (0, 0.0495, 90, 87.4126),
+        (0.2489377, 0, 0, 60.5269),
+        (0.0000077, -0.011977, 90, 11.5950),
+        (0, 0.2905981, 90, -90),
+        (0, 0, -90, 0),
+        (0, 0.0735, 0, 0),
+    ]
+    random = np.random.default_rng(62)
+    for joints in [np.zeros(6), model.lower, model.upper,
+                   *random.uniform(model.lower, model.upper, (100, 6))]:
+        reference = np.eye(4)
+        for q, (a, d, alpha_deg, offset_deg) in zip(joints, rows):
+            theta, alpha = q + math.radians(offset_deg), math.radians(alpha_deg)
+            c, s, ca, sa = math.cos(theta), math.sin(theta), math.cos(alpha), math.sin(alpha)
+            standard = np.array([[c, -s*ca, s*sa, a*c], [s, c*ca, -c*sa, a*s],
+                                 [0, sa, ca, d], [0, 0, 0, 1]])
+            reference = reference @ standard
+        # Original a6=alpha6=0, so both frame 6 definitions coincide.
+        assert np.allclose(model.forward(joints), reference @ model.tcp, atol=1e-12, rtol=0)
 
 
 def test_yaml_matches_defaults():

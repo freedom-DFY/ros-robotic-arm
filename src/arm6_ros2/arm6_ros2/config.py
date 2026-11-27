@@ -1,4 +1,4 @@
-"""Startup defaults. J1–J3 are copied from the recorded real three-axis setup."""
+"""CAD geometry converted to Craig modified DH; encoder alignment is still pending."""
 
 import math
 from pathlib import Path
@@ -8,23 +8,28 @@ import yaml
 DEFAULTS = {
     'device': '/dev/ttyUSB0',
     'baud_rate': 1000000,
-    'base_frame': 'arm3_reference',
+    'base_frame': 'arm6_cad',
     'calibration_confirmed': False,
     'geometry_confirmed': False,
     # J1..J6 then gripper. ID7 is unmeasured: replace after an isolated scan.
     'motor_ids': [1, 2, 3, 5, 4, 11, 7],
     'expected_model_numbers': [1120, 1120, 1120, 1000, 1000, 1000, 1000],
+    # Legacy encoder values, not yet aligned to the CAD saved pose/local +Z axes.
     'zero_ticks': [3819, 989, 2013, 2048, 2048, 2048],
     'joint_directions': [1, -1, -1, 1, 1, 1],
     'position_min_ticks': [0, 740, 1047, 1024, 1024, 1024],
     'position_max_ticks': [4095, 2700, 3347, 3072, 3072, 3072],
-    # STANDARD DH: Rz(q + offset) Tz(d) Tx(a) Rx(alpha).
-    # Retain the original axis convention; upper arm and forearm are 170 mm each.
-    'dh_a_m': [0.0, 0.170, 0.170, 0.0, 0.0, 0.0],
-    'dh_d_m': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    'dh_alpha_rad': [-math.pi / 2, math.pi, 0.0, -math.pi / 2, math.pi / 2, 0.0],
-    'dh_offsets_rad': [0.0, 0.0, math.pi / 2, 0.0, 0.0, 0.0],
-    'tcp_xyz_m': [0.0, 0.0, 0.12],
+    # CRAIG MODIFIED DH: Rx(alpha_prev) Tx(a_prev) Rz(q + offset) Tz(d).
+    # CAD assembly frame; q=0 is the saved pose, positive about servo local +Z.
+    # Per row i: a[i-1], alpha[i-1], d[i], theta_offset[i].
+    'dh_a_m': [0.0, 0.0, 0.2489377, 0.0000077, 0.0, 0.0],
+    'dh_d_m': [0.0495, 0.0, -0.011977, 0.2905981, 0.0, 0.0735],
+    'dh_alpha_rad': [0.0, math.pi / 2, 0.0, math.pi / 2, math.pi / 2, -math.pi / 2],
+    'dh_offsets_rad': [math.radians(87.4126), math.radians(60.5269),
+                       math.radians(11.5950), -math.pi / 2, 0.0, 0.0],
+    # Frame 6 is the gripper adapter CAD origin; d6 already includes 73.5 mm.
+    # Add the measured grasp-point transform here after tool calibration.
+    'tcp_xyz_m': [0.0, 0.0, 0.0],
     'tcp_rpy_rad': [0.0, 0.0, 0.0],
     'gripper_closed_ticks': 1800,
     'gripper_open_ticks': 2600,

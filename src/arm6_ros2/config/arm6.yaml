@@ -1,9 +1,12 @@
 # HARDWARE ONLY: J1..6 use IDs 1,2,3,5,4,11, followed by the gripper.
 # Gripper ID7 is an UNMEASURED placeholder: scan it alone at 1 Mbps and replace.
 # Verify model 1000 on ID5, ID11 and the gripper during the scan.
-# J1..3 retain measured zero/direction/limits; upper arm and forearm are 0.170 m each.
-# J4..6 and gripper are ASSUMED: replace with selected hardware calibration.
-# Standard DH: Rz(q+offset) Tz(d) Tx(a) Rx(alpha); metres and radians.
+# Geometry is converted from the supplied CAD standard DH to Craig modified DH.
+# q=0 is the CAD saved pose; positive rotation follows each servo's local +Z.
+# Legacy zero_ticks/directions/limits require alignment and revalidation for CAD.
+# J4..6 and gripper calibration remain placeholders.
+# Modified DH: Rx(alpha_prev) Tx(a_prev) Rz(q+offset) Tz(d); metres and radians.
+# Row i stores a[i-1], alpha[i-1], d[i], theta_offset[i]; do not use standard rows.
 # All motors: compatible electrical bus, Protocol 2.0, Mode 3, Homing Offset 0.
 # Torque On by Goal Update must be OFF. Startup does not enable torque.
 # calibration_confirmed gates motion; geometry_confirmed also gates TCP targets.
@@ -11,7 +14,7 @@
   ros__parameters:
     device: /dev/ttyUSB0
     baud_rate: 1000000
-    base_frame: arm3_reference
+    base_frame: arm6_cad
     calibration_confirmed: false
     geometry_confirmed: false
     motor_ids:
@@ -60,36 +63,38 @@
     - 3072
     dh_a_m:
     - 0.0
-    - 0.170
-    - 0.170
     - 0.0
+    - 0.2489377
+    - 0.0000077
     - 0.0
     - 0.0
     dh_d_m:
+    - 0.0495
     - 0.0
+    - -0.011977
+    - 0.2905981
     - 0.0
-    - 0.0
-    - 0.0
-    - 0.0
-    - 0.0
+    - 0.0735
     dh_alpha_rad:
-    - -1.5707963267948966
-    - 3.141592653589793
     - 0.0
-    - -1.5707963267948966
     - 1.5707963267948966
     - 0.0
+    - 1.5707963267948966
+    - 1.5707963267948966
+    - -1.5707963267948966
     dh_offsets_rad:
+    - 1.5256376777287952
+    - 1.0563936910253557
+    - 0.20237092676874252
+    - -1.5707963267948966
     - 0.0
     - 0.0
-    - 1.5707963267948966
-    - 0.0
-    - 0.0
-    - 0.0
+    # Frame 6 = gripper adapter CAD origin; d6 already includes the 73.5 mm.
+    # Zero tool transform until the actual grasp-point TCP is measured.
     tcp_xyz_m:
     - 0.0
     - 0.0
-    - 0.12
+    - 0.0
     tcp_rpy_rad:
     - 0.0
     - 0.0
