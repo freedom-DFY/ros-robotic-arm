@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from arm6_ros2 import dynamixel_bus as bus_module
+from arm6_ros2.model import ArmModel, RADIANS_PER_TICK
 
 
 @pytest.fixture
@@ -23,6 +24,9 @@ def sdk(monkeypatch):
     reader.isAvailable.return_value = True
     positions = {1: 3811, 2: 999, 3: 2040}
     reader.getData.side_effect = lambda motor_id, address, size: positions[motor_id]
+    writer = MagicMock()
+    writer.addParam.return_value = True
+    writer.txPacket.return_value = 0
     registers = {}
     for motor_id in (1, 2, 3):
         for address, value in {
@@ -51,9 +55,9 @@ def sdk(monkeypatch):
     monkeypatch.setattr(bus_module, 'PortHandler', lambda device: port)
     monkeypatch.setattr(bus_module, 'PacketHandler', lambda protocol: packet)
     monkeypatch.setattr(bus_module, 'GroupSyncRead', lambda *args: reader)
-    monkeypatch.setattr(bus_module, 'GroupSyncWrite', lambda *args: MagicMock())
+    monkeypatch.setattr(bus_module, 'GroupSyncWrite', lambda *args: writer)
     monkeypatch.setattr(bus_module, 'sleep', lambda _: None)
-    return SimpleNamespace(port=port, packet=packet, reader=reader,
+    return SimpleNamespace(port=port, packet=packet, reader=reader, writer=writer,
                            positions=positions, registers=registers, events=events)
 
 
@@ -222,3 +226,33 @@ def test_seventh_motor_enable_failure_rolls_back_all_seven(sdk):
     assert not bus.possibly_enabled
     assert all(sdk.registers[motor_id, bus_module.TORQUE_ENABLE] == 0 for motor_id in ids)
     bus.close()
+
+
+@pytest.mark.parametrize('small_model', [1000, 1020])
+def test_rewired_feedback_and_j4_goal_use_physical_motor_ids(sdk, small_model):
+    model = ArmModel({'expected_model_numbers': [1120]*3 + [small_model]*4})
+    assert model.ids == (1, 2, 3, 5, 4, 11, 7)  # ID7 remains an unmeasured placeholder.
+    sdk.positions.update({1: 3923, 2: 1061, 3: 2105, 4: 2004, 5: 2055, 11: 2111, 7: 2200})
+    sdk.packet.ping.side_effect = lambda port, motor_id: (
+        1120 if motor_id <= 3 else small_model, 0, 0)
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, model.ids)
+    try:
+        assert bus.models == model.models
+        raw = bus.read_positions()
+        assert raw == (3923, 1061, 2105, 2055, 2004, 2111, 2200)
+        assert not sdk.events  # Startup and feedback do not write registers.
+        bus.write_positions(model.encode(model.decode(raw)))
+        before = {call.args[0]: int.from_bytes(bytes(call.args[1]), 'little')
+                  for call in sdk.writer.addParam.call_args_list}
+        sdk.writer.addParam.reset_mock()
+
+        target = model.decode(raw)
+        target[3] += 10 * RADIANS_PER_TICK
+        bus.write_positions(model.encode(target))
+        calls = sdk.writer.addParam.call_args_list
+        assert [call.args[0] for call in calls] == [1, 2, 3, 5, 4, 11, 7]
+        after = {call.args[0]: int.from_bytes(bytes(call.args[1]), 'little') for call in calls}
+        assert {motor_id for motor_id in before if before[motor_id] != after[motor_id]} == {5}
+        assert after[5] == before[5] + 10
+    finally:
+        bus.close()

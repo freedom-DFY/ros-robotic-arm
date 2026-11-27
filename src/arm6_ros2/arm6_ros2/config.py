@@ -11,15 +11,16 @@ DEFAULTS = {
     'base_frame': 'arm3_reference',
     'calibration_confirmed': False,
     'geometry_confirmed': False,
-    'motor_ids': [1, 2, 3, 4, 5, 6, 7],
-    'expected_model_numbers': [1120, 1120, 1120, 1020, 1020, 1020, 1020],
+    # J1..J6 then gripper. ID7 is unmeasured: replace after an isolated scan.
+    'motor_ids': [1, 2, 3, 5, 4, 11, 7],
+    'expected_model_numbers': [1120, 1120, 1120, 1000, 1000, 1000, 1000],
     'zero_ticks': [3819, 989, 2013, 2048, 2048, 2048],
     'joint_directions': [1, -1, -1, 1, 1, 1],
     'position_min_ticks': [0, 740, 1047, 1024, 1024, 1024],
     'position_max_ticks': [4095, 2700, 3347, 3072, 3072, 3072],
     # STANDARD DH: Rz(q + offset) Tz(d) Tx(a) Rx(alpha).
-    # The first three rows preserve the measured original wrist-point model.
-    'dh_a_m': [0.0, 0.24606, 0.24225, 0.0, 0.0, 0.0],
+    # Retain the original axis convention; upper arm and forearm are 170 mm each.
+    'dh_a_m': [0.0, 0.170, 0.170, 0.0, 0.0, 0.0],
     'dh_d_m': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     'dh_alpha_rad': [-math.pi / 2, math.pi, 0.0, -math.pi / 2, math.pi / 2, 0.0],
     'dh_offsets_rad': [0.0, 0.0, math.pi / 2, 0.0, 0.0, 0.0],

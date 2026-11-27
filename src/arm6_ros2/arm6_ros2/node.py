@@ -77,7 +77,7 @@ class Controller(Node):
             callback_group=ReentrantCallbackGroup())
         self.timer = self.create_timer(1/self.p['rate_hz'], self.tick,
                                       clock=Clock(clock_type=ClockType.STEADY_TIME))
-        self.get_logger().info('Six-axis arm + ID7 gripper ready; manual enable required. '
+        self.get_logger().info(f'Six-axis arm + ID{self.model.ids[-1]} gripper ready; manual enable required. '
                                f'device={self.p["device"]}, state={self.state}')
 
     def _validate_settings(self):

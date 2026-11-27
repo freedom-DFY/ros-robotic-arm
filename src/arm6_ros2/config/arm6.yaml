@@ -1,5 +1,7 @@
-# HARDWARE ONLY: six rotary arm joints (ID1..6) plus independent gripper (ID7).
-# J1..3 retain measured zero/direction/limits and original wrist-point geometry.
+# HARDWARE ONLY: J1..6 use IDs 1,2,3,5,4,11, followed by the gripper.
+# Gripper ID7 is an UNMEASURED placeholder: scan it alone at 1 Mbps and replace.
+# Verify model 1000 on ID5, ID11 and the gripper during the scan.
+# J1..3 retain measured zero/direction/limits; upper arm and forearm are 0.170 m each.
 # J4..6 and gripper are ASSUMED: replace with selected hardware calibration.
 # Standard DH: Rz(q+offset) Tz(d) Tx(a) Rx(alpha); metres and radians.
 # All motors: compatible electrical bus, Protocol 2.0, Mode 3, Homing Offset 0.
@@ -16,18 +18,18 @@
     - 1
     - 2
     - 3
-    - 4
     - 5
-    - 6
-    - 7
+    - 4
+    - 11
+    - 7  # TODO: replace with the measured gripper ID; seven distinct IDs required.
     expected_model_numbers:
     - 1120
     - 1120
     - 1120
-    - 1020
-    - 1020
-    - 1020
-    - 1020
+    - 1000
+    - 1000
+    - 1000
+    - 1000
     zero_ticks:
     - 3819
     - 989
@@ -58,8 +60,8 @@
     - 3072
     dh_a_m:
     - 0.0
-    - 0.24606
-    - 0.24225
+    - 0.170
+    - 0.170
     - 0.0
     - 0.0
     - 0.0

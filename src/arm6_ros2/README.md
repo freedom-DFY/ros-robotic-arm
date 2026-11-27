@@ -11,19 +11,20 @@
 | J1–J3 | XM540-W270，ID1/2/3，型号号 1120 |
 | 前三轴零位/方向 | `[3819,989,2013]` / `[1,-1,-1]` |
 | 前三轴运行限位 | `[0,740,1047]` 至 `[4095,2700,3347]` tick |
-| 大臂/小臂 | 0.24606 / 0.24225 m |
+| 大臂/小臂 | 0.170 / 0.170 m（各 170 mm） |
 | 前三轴速度上限 | 0.02 rad/s |
-| J4–J6（假设） | XM430-W350，ID4/5/6，型号号 1020，零位 2048，方向 +1，限位 1024–3072 tick |
+| J4–J6 | XH430-W350，依次为 ID5/4/11，型号号 1000；零位 2048、方向 +1、限位 1024–3072 tick 均待标定 |
 | 腕部（假设） | 三转轴相交的球腕 |
 | TCP（假设） | 沿法兰局部 Z 轴偏移 0.12 m，姿态偏置为零 |
-| 夹爪（假设） | XM430-W350，ID7；1800 tick 闭合、2600 tick 张开，完整开口 0–0.06 m |
+| 夹爪（待扫描/标定） | XH430-W350，型号号暂填 1000；ID7 仅为未实测占位值；1800 tick 闭合、2600 tick 张开、完整开口 0–0.06 m 均待标定 |
 
 夹爪不占手臂六个旋转自由度，系统共七个电机。
 前三轴的标定依据整理在 [硬件说明](../../docs/hardware/README.md)。
 控制表参考 ROBOTIS 官方手册：[XM540-W270](https://emanual.robotis.com/docs/en/dxl/x/xm540-w270/)、
-[XM430-W350](https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/)。
+[XM430-W350](https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/)、
+[XH430-W350](https://emanual.robotis.com/docs/en/dxl/x/xh430-w350/)。
 
-当前驱动只支持上述两个型号共用的 X 系列控制表和 4096 刻度单圈编码。
+当前驱动支持上述三个型号在本程序中使用的 X 系列控制表和 4096 刻度单圈编码。
 所有电机应连接兼容的 TTL 或 RS-485 电气总线，使用相同波特率、Protocol 2.0、
 Position Control Mode 3、Homing Offset 0，并关闭 Torque On by Goal Update。
 程序不自动修改运行模式或 EEPROM 参数。
@@ -38,17 +39,24 @@ T_base_tcp = T01 T12 T23 T34 T45 T56 T_flange_tcp
 | 关节 | a (m) | d (m) | alpha (rad) | offset (rad) |
 | --- | --- | --- | --- | --- |
 | J1 | 0 | 0 | -π/2 | 0 |
-| J2 | 0.24606 | 0 | π | 0 |
-| J3 | 0.24225 | 0 | 0 | π/2 |
+| J2 | 0.170 | 0 | π | 0 |
+| J3 | 0.170 | 0 | 0 | π/2 |
 | J4 | 0 | 0 | -π/2 | 0 |
 | J5 | 0 | 0 | π/2 | 0 |
 | J6 | 0 | 0 | 0 | 0 |
 
-前三行与原腕部点位置公式等价，回归测试独立检查其结果，不再依赖旧三轴源码。
+前三行沿用原腕部点位置公式的坐标约定，连杆长度更新为大臂、小臂各 0.170 m。
+回归测试独立检查其结果，不再依赖旧三轴源码。
 编码换算保持 `q=(tick-zero)*direction*2π/4096`。
 默认参考系名称保留 `arm3_reference`，只是沿用坐标名称，不依赖旧三轴包。
 
 ## 2. 安装与启动
+
+启动前先用 Wizard 以 **1000000（1 Mbps）** 单独扫描末端夹爪，将实测整数 ID
+填入 `config/arm6.yaml` 的 `motor_ids` 最后一项；当前 ID7 仅为占位值。
+若同时更新包的 Python 默认值，也需同步修改 `arm6_ros2/config.py`。
+七项顺序为 **J1、J2、J3、J4、J5、J6、夹爪**，即 `[1,2,3,5,4,11,末端实测ID]`，
+必须互不重复。扫描时一起核对 ID5、ID11 和夹爪的型号号是否为 1000。
 
 从工作空间根目录执行：
 
@@ -62,7 +70,15 @@ ros2 launch arm6_ros2 arm6.launch.py device:=/dev/ttyUSB0 baud_rate:=1000000
 
 `dynamixel_sdk` 由 ROS 系统依赖提供；缺失时执行 `sudo apt install ros-jazzy-dynamixel-sdk`。
 启动会连接并检查全部七个电机型号，缺少电机或型号不符时退出，不使用虚拟反馈替代。
-启动成功后仅只读反馈，手动使能才会原地保持：
+`baud_rate:=` 启动参数会覆盖 YAML 的波特率。
+首次启动保持只读，先按上述 `motor_ids` 顺序核对七个反馈槽位：
+
+```bash
+ros2 topic echo /arm6/encoder_ticks
+```
+
+调用 `/arm6/enable` 会给全部七个电机上扭矩并原地保持，
+即使 `calibration_confirmed` 和 `geometry_confirmed` 仍为 `false`：
 
 ```bash
 ros2 service call /arm6/enable std_srvs/srv/SetBool '{data: true}'
@@ -102,7 +118,8 @@ ros2 launch arm6_ros2 arm6.launch.py \
 | `calibration_confirmed` | 七电机标定、方向和运行边界验证后设 true，允许实机运动 |
 | `geometry_confirmed` | DH 和 TCP 实测验证后设 true，额外允许末端位姿目标 |
 
-后三轴与夹爪型号、零位、限位、DH 和 TCP 尚属假设，默认两个 confirmed 参数均为 false。
+ID5、ID11 和夹爪的型号仍待扫描核对，后三轴与夹爪的零位、限位、DH 和 TCP 待实测标定，
+默认两个 confirmed 参数均为 false。
 确认标志约束运动请求，不妨碍初始使能保持。运行边界必须位于电机内部位置限位中。
 
 ## 4. 关节、TCP 与夹爪命令

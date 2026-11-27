@@ -83,8 +83,9 @@ class ArmModel:
             raise ValueError('motor_ids must contain seven distinct IDs (six joints then gripper)')
         self.models = tuple(p['expected_model_numbers'])
         # Only the verified common X-series control table is supported by this driver.
-        if len(self.models) != 7 or any(m not in (1120, 1020) for m in self.models):
-            raise ValueError('Supported model numbers: XM540-W270=1120, XM430-W350=1020')
+        if len(self.models) != 7 or any(m not in (1120, 1020, 1000) for m in self.models):
+            raise ValueError('Supported model numbers: XM540-W270=1120, XM430-W350=1020, '
+                             'XH430-W350=1000')
         self.zero = vector(p['zero_ticks'], 6, 'zero_ticks')
         self.sign = vector(p['joint_directions'], 6, 'joint_directions')
         self.tick_min = vector(p['position_min_ticks'], 6, 'position_min_ticks')

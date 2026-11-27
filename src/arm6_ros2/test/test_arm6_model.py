@@ -15,7 +15,7 @@ from arm6_ros2.trajectory import Plan
 REFERENCE_TICKS = [3923, 1061, 2105, 2048, 2300, 2048, 2200]
 
 
-def test_first_three_axes_match_recorded_calibration_and_original_fk():
+def test_first_three_axes_match_recorded_calibration_and_updated_link_fk():
     model = ArmModel()
     assert DEFAULTS['zero_ticks'][:3] == [3819, 989, 2013]
     assert DEFAULTS['joint_directions'][:3] == [1, -1, -1]
@@ -27,9 +27,9 @@ def test_first_three_axes_match_recorded_calibration_and_original_fk():
     for _ in range(100):
         joints = random.uniform(model.lower, model.upper)
         t1, t2, t3 = joints[:3] + np.array([0, 0, math.pi/2])
-        radial = 0.24606*math.cos(t2) + 0.24225*math.cos(t2-t3)
+        radial = 0.170*math.cos(t2) + 0.170*math.cos(t2-t3)
         expected = [radial*math.cos(t1), radial*math.sin(t1),
-                    -0.24606*math.sin(t2)-0.24225*math.sin(t2-t3)]
+                    -0.170*math.sin(t2)-0.170*math.sin(t2-t3)]
         assert np.allclose(model.chain(joints)[3][:3, 3], expected, atol=1e-12)
 
 
