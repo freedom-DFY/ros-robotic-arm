@@ -116,7 +116,18 @@ class ArmModel:
         if (any(type(t) is not int or not 0 <= t <= 4095 for t in (closed, opened))
                 or closed == opened or not math.isfinite(self.width) or self.width <= 0):
             raise ValueError('Invalid gripper endpoint calibration')
+        self.gripper_wraps_zero = p['gripper_wraps_zero']
+        if type(self.gripper_wraps_zero) is not bool:
+            raise ValueError('gripper_wraps_zero must be boolean')
         self.closed, self.opened = closed, opened
+        if self.gripper_wraps_zero:
+            # Lift the low endpoint once, never modulo a commanded position.
+            # Mode 4 then follows 3180..4376 continuously through encoder zero.
+            if closed < opened:
+                self.closed += 4096
+            else:
+                self.opened += 4096
+        self.gripper_limits = (min(self.closed, self.opened), max(self.closed, self.opened))
         self.velocity = np.r_[vector(p['joint_velocity_limits_rad_s'], 6, 'velocity limits'),
                               p['gripper_speed_m_s']]
         self.acceleration = np.r_[vector(p['joint_acceleration_limits_rad_s2'], 6, 'acceleration limits'),
@@ -127,8 +138,12 @@ class ArmModel:
 
     def decode(self, ticks):
         ticks = vector(ticks, 7, 'encoder feedback')
+        gripper = ticks[6]
+        if (self.gripper_wraps_zero and 0 <= gripper < 4096
+                and gripper < self.gripper_limits[0]):
+            gripper += 4096
         return np.r_[(ticks[:6]-self.zero)*self.sign*RADIANS_PER_TICK,
-                     (ticks[6]-self.closed)*self.width/(self.opened-self.closed)]
+                     (gripper-self.closed)*self.width/(self.opened-self.closed)]
 
     def encode(self, state):
         state = vector(state, 7, 'joint and gripper target')

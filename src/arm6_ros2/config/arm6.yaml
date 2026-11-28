@@ -1,15 +1,18 @@
 # HARDWARE ONLY: J1..6 use IDs 1,2,3,5,4,11, followed by the gripper.
-# Gripper ID7 is an UNMEASURED placeholder: scan it alone at 1 Mbps and replace.
+# Gripper ID12: closed 3180 -> 4095 -> 0 -> open 280; opening width is pending.
 # Verify model 1000 on ID5, ID11 and the gripper during the scan.
 # Geometry is converted from the supplied CAD standard DH to Craig modified DH.
 # q=0 is the CAD saved pose; positive rotation follows each servo's local +Z.
 # Legacy zero_ticks/directions/limits require alignment and revalidation for CAD.
-# J4..6 and gripper calibration remain placeholders.
+# ID5: -145..45 deg about tick 2048 (+1), stored inward as 399..2560 ticks.
+# ID4/ID11: 0..4095 ticks, bounded single-turn motion without endpoint wrapping.
+# J5/J6 encoder alignment and gripper physical opening width remain pending.
 # Modified DH: Rx(alpha_prev) Tx(a_prev) Rz(q+offset) Tz(d); metres and radians.
 # Row i stores a[i-1], alpha[i-1], d[i], theta_offset[i]; do not use standard rows.
-# All motors: compatible electrical bus, Protocol 2.0, Mode 3, Homing Offset 0.
+# Protocol 2.0, Homing Offset 0; J1..6 Mode 3, zero-crossing gripper Mode 4.
 # Torque On by Goal Update must be OFF. Startup does not enable torque.
 # calibration_confirmed gates motion; geometry_confirmed also gates TCP targets.
+# Confirmed encoder home can run separately, without changing CAD zero_ticks.
 /**:
   ros__parameters:
     device: /dev/ttyUSB0
@@ -17,6 +20,11 @@
     base_frame: arm6_cad
     calibration_confirmed: false
     geometry_confirmed: false
+    home_on_enable: true
+    home_confirmed: true
+    home_ticks: [3449, 1227, 1416, 1117, 1298, 2525]  # User-defined physical origin, independent of CAD.
+    home_arrival_tolerance_rad: 0.05235987755982989  # 3 degrees, homing only.
+    calibration_jog_step_ticks: 20  # Single selected joint only; about 1.76 degrees.
     motor_ids:
     - 1
     - 2
@@ -24,7 +32,7 @@
     - 5
     - 4
     - 11
-    - 7  # TODO: replace with the measured gripper ID; seven distinct IDs required.
+    - 12  # Gripper; seven distinct IDs required.
     expected_model_numbers:
     - 1120
     - 1120
@@ -50,17 +58,17 @@
     position_min_ticks:
     - 0
     - 740
-    - 1047
-    - 1024
-    - 1024
-    - 1024
+    - 1043  # Current holding pose sampled at 1043..1044; user requested new lower bound.
+    - 399
+    - 0
+    - 0
     position_max_ticks:
     - 4095
     - 2700
     - 3347
-    - 3072
-    - 3072
-    - 3072
+    - 2560
+    - 4095
+    - 4095
     dh_a_m:
     - 0.0
     - 0.0
@@ -99,8 +107,9 @@
     - 0.0
     - 0.0
     - 0.0
-    gripper_closed_ticks: 1800
-    gripper_open_ticks: 2600
+    gripper_closed_ticks: 3180
+    gripper_open_ticks: 280
+    gripper_wraps_zero: true
     gripper_max_width_m: 0.06
     gripper_speed_m_s: 0.01
     joint_velocity_limits_rad_s:

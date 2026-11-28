@@ -23,6 +23,11 @@ setup(
     license='Apache-2.0',
     entry_points={'console_scripts': [
         'arm6_node = arm6_ros2.node:main',
+        'forward_line_test = arm6_ros2.forward_line_test:main',
+        'encoder_calibration = arm6_ros2.encoder_calibration:main',
+        'desktop_control = arm6_ros2.desktop_control:main',
+        'gamepad_monitor = arm6_ros2.gamepad_monitor:main',
+        'gamepad_control = arm6_ros2.gamepad_control:main',
     ]},
 )
 

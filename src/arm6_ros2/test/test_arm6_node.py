@@ -20,7 +20,7 @@ from std_srvs.srv import SetBool, Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from arm6_ros2.config import DEFAULTS
-from arm6_ros2.model import JOINT_NAMES, quaternion_from_matrix
+from arm6_ros2.model import ArmModel, JOINT_NAMES, quaternion_from_matrix
 from arm6_ros2.node import Controller
 from arm6_ros2.trajectory import Plan
 
@@ -31,8 +31,9 @@ def controller(monkeypatch):
     rclpy.init(context=context)
     from arm6_ros2 import dynamixel_bus
     monkeypatch.setattr(dynamixel_bus, 'DynamixelBus',
-                        lambda device, baud, ids: FakeBus([3923, 1061, 2105, 2048, 2300, 2048, 2200]))
+                        lambda device, baud, ids, **options: FakeBus([3923, 1061, 2105, 2048, 2300, 2048, 3550]))
     node = Controller(context=context)
+    node.p['home_on_enable'] = False
     node.p['calibration_confirmed'] = True
     node.p['geometry_confirmed'] = True
     node.tick()
@@ -70,6 +71,69 @@ def test_manual_enable_and_joint_name_order(controller):
     assert np.allclose(node.model.decode(node.measured)[:6], target, atol=0.001)
 
 
+def test_enable_returns_to_taught_home_and_preserves_gripper(controller):
+    node = controller
+    node.p['home_on_enable'] = True
+    # Encoder-taught home is independent of unverified CAD calibration.
+    node.p['calibration_confirmed'] = False
+    node.p['geometry_confirmed'] = False
+    start = node.measured
+    assert enable(node).success
+    assert node.state == 'moving'
+    plan = node.active['plan']
+    for elapsed in np.linspace(0, plan.duration, 51):
+        raw = node.model.encode(plan.sample(elapsed))
+        assert raw[6] == start[6]
+        assert all(lo <= tick <= hi for lo, tick, hi in
+                   zip(node.model.tick_min, raw[:6], node.model.tick_max))
+    # Repeated enable must not replace a running home trajectory.
+    assert enable(node).success
+    assert node.active['plan'] is plan
+    finish(node)
+    assert node.measured == tuple(node.p['home_ticks']) + (start[6],)
+    assert node.state == 'holding'
+    # Each new disabled -> enabled transition returns to the saved pose.
+    assert enable(node, False).success
+    node.bus.raw = start
+    node.tick()
+    assert enable(node).success
+    finish(node)
+    assert node.measured == tuple(node.p['home_ticks']) + (start[6],)
+
+
+@pytest.mark.parametrize('case', ['unconfirmed', 'arm_outside', 'gripper_outside', 'home_outside'])
+def test_invalid_auto_home_is_rejected_before_torque_on(controller, case):
+    node = controller
+    node.p['home_on_enable'] = True
+    node.bus.arm = MagicMock(side_effect=AssertionError('Must not enable torque'))
+    if case == 'unconfirmed':
+        node.p['home_confirmed'] = False
+    elif case == 'arm_outside':
+        raw = list(node.bus.raw)
+        raw[2] = 1041
+        node.bus.raw = tuple(raw)
+    elif case == 'gripper_outside':
+        raw = list(node.bus.raw)
+        raw[6] = 3152
+        node.bus.raw = tuple(raw)
+    else:
+        node.p['home_ticks'] = [3372, 992, 1041, 1063, 1250, 2487]
+    assert not enable(node).success
+    node.bus.arm.assert_not_called()
+    assert not node.enabled and node.active is None
+    assert not node.bus.writes
+
+
+def test_auto_home_rechecks_register_bounds_after_enable(controller):
+    node = controller
+    node.p['home_on_enable'] = True
+    node.bus.position_limits = ((0, 4095),)*6 + ((3400, 3700),)
+    assert not enable(node).success
+    assert node.state == 'fault' and node.active is None
+    # Failure after torque-on holds measured feedback and never commands home.
+    assert node.bus.writes[-1] == node.measured
+
+
 @pytest.mark.parametrize('message', [
     JointState(position=[0.0]*5), JointState(position=[float('nan')]*6),
     JointState(position=[10.0]*6), JointState(name=['joint_1']*6, position=[0.0]*6),
@@ -93,7 +157,7 @@ def test_gripper_does_not_change_arm_and_busy_commands_do_not_replace_it(control
     assert node.active is active
     finish(node)
     assert node.measured[:6] == original[:6]
-    assert node.measured[6] == DEFAULTS['gripper_open_ticks']
+    assert node.measured[6] == 4376
     assert node.close_gripper(None, None).success
     finish(node)
     assert node.measured[:6] == original[:6]
@@ -218,7 +282,7 @@ def test_invalid_trajectory_goals_rejected(controller, change):
 class FakeBus:
     def __init__(self, raw):
         self.raw = tuple(raw)
-        self.position_limits = ((0, 4095),)*7
+        self.position_limits = ((0, 4095),)*6 + (ArmModel().gripper_limits,)
         self.writes = []
         self.models = tuple(DEFAULTS['expected_model_numbers'])
         self.follow_commands = True
@@ -236,6 +300,9 @@ class FakeBus:
 
     def read_hardware_errors(self):
         return (0,)*7
+
+    def write_verified_positions(self, raw):
+        self.write_positions(raw)
 
     def disarm(self):
         return []
@@ -258,7 +325,7 @@ def test_real_motion_gates_calibration_and_geometry(controller):
         node._ready(cartesian=True)
     node.p['geometry_confirmed'] = True
     node._ready(cartesian=True)
-    node.bus.position_limits = ((0, 4095),)*6+((2000, 2500),)
+    node.bus.position_limits = ((0, 4095),)*6+((3400, 3700),)
     with pytest.raises(ValueError, match='register limits'):
         node._ready()
 
@@ -326,7 +393,7 @@ def test_startup_model_mismatch_closes_bus_without_enabling(monkeypatch):
     bus.models = (1120,)*7
     bus.arm = MagicMock()
     bus.close = MagicMock()
-    monkeypatch.setattr(dynamixel_bus, 'DynamixelBus', lambda device, baud, ids: bus)
+    monkeypatch.setattr(dynamixel_bus, 'DynamixelBus', lambda device, baud, ids, **options: bus)
     try:
         with pytest.raises(ValueError, match='Model mismatch'):
             Controller(context=context)

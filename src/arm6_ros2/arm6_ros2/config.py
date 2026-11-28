@@ -11,14 +11,24 @@ DEFAULTS = {
     'base_frame': 'arm6_cad',
     'calibration_confirmed': False,
     'geometry_confirmed': False,
-    # J1..J6 then gripper. ID7 is unmeasured: replace after an isolated scan.
-    'motor_ids': [1, 2, 3, 5, 4, 11, 7],
+    # User-taught encoder pose, independent of CAD zero_ticks. Gripper is held.
+    'home_on_enable': True,
+    'home_confirmed': True,
+    'home_ticks': [3449, 1227, 1416, 1117, 1298, 2525],
+    'home_arrival_tolerance_rad': math.radians(3.0),
+    'calibration_jog_step_ticks': 20,
+    # J1..J6 then gripper; the gripper ID is confirmed by the user.
+    'motor_ids': [1, 2, 3, 5, 4, 11, 12],
     'expected_model_numbers': [1120, 1120, 1120, 1000, 1000, 1000, 1000],
     # Legacy encoder values, not yet aligned to the CAD saved pose/local +Z axes.
     'zero_ticks': [3819, 989, 2013, 2048, 2048, 2048],
     'joint_directions': [1, -1, -1, 1, 1, 1],
-    'position_min_ticks': [0, 740, 1047, 1024, 1024, 1024],
-    'position_max_ticks': [4095, 2700, 3347, 3072, 3072, 3072],
+    # J1/J2 retain legacy bounds; ID3 lower bound is the measured holding pose.
+    # ID5: -145..45 deg about tick 2048, sign +1;
+    # round the lower tick inward (ceil(2048 - 145*4096/360) = 399).
+    # ID4 and ID11: bounded 0..4095; endpoints never wrap into another turn.
+    'position_min_ticks': [0, 740, 1043, 399, 0, 0],
+    'position_max_ticks': [4095, 2700, 3347, 2560, 4095, 4095],
     # CRAIG MODIFIED DH: Rx(alpha_prev) Tx(a_prev) Rz(q + offset) Tz(d).
     # CAD assembly frame; q=0 is the saved pose, positive about servo local +Z.
     # Per row i: a[i-1], alpha[i-1], d[i], theta_offset[i].
@@ -31,8 +41,11 @@ DEFAULTS = {
     # Add the measured grasp-point transform here after tool calibration.
     'tcp_xyz_m': [0.0, 0.0, 0.0],
     'tcp_rpy_rad': [0.0, 0.0, 0.0],
-    'gripper_closed_ticks': 1800,
-    'gripper_open_ticks': 2600,
+    # ID12 opens across encoder zero: 3180 -> 4095 -> 0 -> 280 (1196 ticks).
+    # Only this motor uses bounded Extended Position Mode 4; J1..6 stay Mode 3.
+    'gripper_closed_ticks': 3180,
+    'gripper_open_ticks': 280,
+    'gripper_wraps_zero': True,
     'gripper_max_width_m': 0.06,
     'gripper_speed_m_s': 0.01,
     'joint_velocity_limits_rad_s': [0.02, 0.02, 0.02, 0.10, 0.10, 0.10],

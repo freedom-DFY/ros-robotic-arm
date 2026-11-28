@@ -1,0 +1,70 @@
+{
+  "captured_at": "2026-11-27T22:26:52+08:00",
+  "reference": "User-provided photo of the folded standby/home pose",
+  "controller_state": "holding",
+  "motor_ids": [
+    1,
+    2,
+    3,
+    5,
+    4,
+    11,
+    12
+  ],
+  "measured_ticks": [
+    3371,
+    987,
+    1217,
+    1062,
+    1217,
+    2487,
+    3550
+  ],
+  "sample_min_ticks": [
+    3371,
+    986,
+    1216,
+    1061,
+    1217,
+    2487,
+    3550
+  ],
+  "sample_max_ticks": [
+    3371,
+    987,
+    1217,
+    1062,
+    1218,
+    2488,
+    3550
+  ],
+  "sample_count": 36,
+  "configured_home_ticks": [
+    3372,
+    992,
+    1249,
+    1063,
+    1250,
+    2487
+  ],
+  "unverified_zero_ticks": [
+    3819,
+    989,
+    2013,
+    2048,
+    2048,
+    2048
+  ],
+  "unverified_joint_directions": [
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    1
+  ],
+  "cad_zero_alignment_confirmed": false,
+  "joint_directions_confirmed": false,
+  "geometry_confirmed": false,
+  "note": "Standby reference only. Do not use these measured ticks as CAD zero ticks without matching the CAD saved pose."
+}

@@ -12,13 +12,13 @@ from arm6_ros2.model import (ArmModel, pose_matrix, quaternion_from_matrix,
                             rotation_exp, rotation_vector)
 from arm6_ros2.trajectory import Plan
 
-REFERENCE_TICKS = [3923, 1061, 2105, 2048, 2300, 2048, 2200]
+REFERENCE_TICKS = [3923, 1061, 2105, 2048, 2300, 2048, 3550]
 
 
-def test_legacy_encoder_defaults_retained_pending_cad_alignment():
+def test_encoder_calibration_and_measured_motion_limits():
     assert DEFAULTS['zero_ticks'][:3] == [3819, 989, 2013]
     assert DEFAULTS['joint_directions'][:3] == [1, -1, -1]
-    assert DEFAULTS['position_min_ticks'][:3] == [0, 740, 1047]
+    assert DEFAULTS['position_min_ticks'][:3] == [0, 740, 1043]
     assert DEFAULTS['position_max_ticks'][:3] == [4095, 2700, 3347]
     assert DEFAULTS['motor_ids'][:3] == [1, 2, 3]
     assert DEFAULTS['joint_velocity_limits_rad_s'][:3] == [0.02]*3
@@ -100,23 +100,107 @@ def test_configuration_sections_and_obsolete_options(tmp_path):
 
 
 def test_encoding_roundtrip_and_reversed_gripper():
-    for parameters in ({}, {'gripper_open_ticks': 1800, 'gripper_closed_ticks': 2600}):
+    for parameters in ({}, {'gripper_open_ticks': 3180, 'gripper_closed_ticks': 280},
+                       {'gripper_wraps_zero': False, 'gripper_closed_ticks': 350, 'gripper_open_ticks': 3150},
+                       {'gripper_wraps_zero': False, 'gripper_closed_ticks': 3150, 'gripper_open_ticks': 350}):
         model = ArmModel(parameters)
-        for raw in ((0, 740, 1047, 1024, 1024, 1024, 1800),
-                    (4095, 2700, 3347, 3072, 3072, 3072, 2600), REFERENCE_TICKS):
+        reference = REFERENCE_TICKS.copy()
+        reference[6] = sum(model.gripper_limits) // 2
+        for raw in ((0, 740, 1043, 399, 0, 0, model.gripper_limits[0]),
+                    (4095, 2700, 3347, 2560, 4095, 4095, model.gripper_limits[1]), reference):
             assert model.encode(model.decode(raw)) == tuple(raw)
         assert model.encode(np.r_[np.zeros(6), 0])[6] == model.closed
         assert model.encode(np.r_[np.zeros(6), model.width])[6] == model.opened
+        midpoint = REFERENCE_TICKS.copy()
+        midpoint[6] = sum(model.gripper_limits) // 2
+        assert model.decode(midpoint)[6] == pytest.approx(model.width / 2)
+        for outside_tick in (model.gripper_limits[0]-1, model.gripper_limits[1]+1):
+            raw = REFERENCE_TICKS.copy()
+            raw[6] = outside_tick
+            with pytest.raises(ValueError, match='outside calibrated motion limits'):
+                model.encode(model.decode(raw))
         for state in (np.r_[np.zeros(6), -0.001], np.zeros(6), np.full(7, np.nan)):
             with pytest.raises(ValueError):
                 model.encode(state)
+
+
+def test_gripper_zero_crossing_is_one_continuous_bounded_arc():
+    model = ArmModel()
+    raw = REFERENCE_TICKS.copy()
+    raw[6] = 3180
+    closed = model.decode(raw)
+    raw[6] = 280
+    opened = model.decode(raw)
+    assert closed[6] == 0
+    assert opened[6] == pytest.approx(model.width)
+    plan = Plan(model, closed, [opened])
+    ticks = np.array([model.encode(plan.sample(t))[6]
+                      for t in np.linspace(0, plan.duration, 301)])
+    assert ticks[0] == 3180 and ticks[-1] == 4376
+    assert ticks[-1]-ticks[0] == 1196
+    assert np.all(np.diff(ticks) >= 0)
+    assert np.any(ticks < 4096) and np.any(ticks >= 4096)
+    for outside in (281, 2000, 3179, 4377, 4376+4096):
+        raw[6] = outside
+        with pytest.raises(ValueError, match='outside calibrated motion limits'):
+            model.encode(model.decode(raw))
+
+
+def test_id5_measured_angle_bounds_round_inward():
+    model = ArmModel()
+    for tick in (399, 2560):
+        raw = REFERENCE_TICKS.copy()
+        raw[3] = tick
+        state = model.decode(raw)
+        assert -145 <= math.degrees(state[3]) <= 45
+        assert model.encode(state) == tuple(raw)
+    for angle in (-145, 45):
+        state = model.decode(REFERENCE_TICKS)
+        state[3] = math.radians(angle)
+        # The integer lower bound is conservatively inside the measured range.
+        if angle == -145:
+            with pytest.raises(ValueError, match='outside calibrated motion limits'):
+                model.encode(state)
+        else:
+            assert model.encode(state)[3] == 2560
+    for tick in (398, 2561):
+        raw = REFERENCE_TICKS.copy()
+        raw[3] = tick
+        with pytest.raises(ValueError, match='outside calibrated motion limits'):
+            model.encode(model.decode(raw))
+
+
+@pytest.mark.parametrize('start_tick,end_tick', [(4095, 0), (0, 4095)])
+def test_id11_traverses_single_turn_interval_without_wrapping(start_tick, end_tick):
+    model = ArmModel()
+    start_raw = REFERENCE_TICKS.copy()
+    end_raw = REFERENCE_TICKS.copy()
+    start_raw[5], end_raw[5] = start_tick, end_tick
+    start, end = model.decode(start_raw), model.decode(end_raw)
+    plan = Plan(model, start, [end])
+    ticks = np.array([model.encode(plan.sample(t))[5]
+                      for t in np.linspace(0, plan.duration, 201)])
+    assert ticks[0] == start_tick and ticks[-1] == end_tick
+    assert 2047 <= ticks[100] <= 2048
+    assert np.all((0 <= ticks) & (ticks <= 4095))
+    assert np.all(np.diff(ticks) * np.sign(end_tick-start_tick) >= 0)
+    for outside_tick in (-1, 4096):
+        outside = start_raw.copy()
+        outside[5] = outside_tick
+        with pytest.raises(ValueError, match='outside calibrated motion limits'):
+            Plan(model, start, [model.decode(outside)])
+    for turns in (-1, 1, 2):
+        target = start.copy()
+        target[5] += turns * 2 * math.pi
+        with pytest.raises(ValueError, match='outside calibrated motion limits'):
+            Plan(model, start, [target])
 
 
 @pytest.mark.parametrize('settings', [
     {'motor_ids': [1, 2, 3, 4, 5, 6, 6]}, {'expected_model_numbers': [1120]*6+[999]},
     {'dh_a_m': [0]*5}, {'dh_offsets_rad': [0, 0, 0, 0, 0, float('nan')]},
     {'joint_directions': [1, 1, 1, 1, 1, 0]}, {'position_min_ticks': [0]*5+[4096]},
-    {'gripper_open_ticks': 1800}, {'gripper_speed_m_s': float('nan')},
+    {'gripper_open_ticks': 3180}, {'gripper_speed_m_s': float('nan')},
 ])
 def test_invalid_configuration(settings):
     with pytest.raises(ValueError):

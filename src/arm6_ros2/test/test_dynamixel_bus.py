@@ -228,18 +228,101 @@ def test_seventh_motor_enable_failure_rolls_back_all_seven(sdk):
     bus.close()
 
 
+@pytest.mark.parametrize('raw_gripper,canonical', [(3550, 3550), (100, 4196),
+                                                  (-546, 3550), (15838, 3550)])
+def test_wrapped_gripper_anchors_actual_counter_without_full_turn_jump(sdk, raw_gripper, canonical):
+    ids = seven_motors(sdk)
+    sdk.positions[7] = raw_gripper & 0xffffffff
+    sdk.registers[7, bus_module.OPERATING_MODE] = 4
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, ids, gripper_wrap_limits=(3180, 4376))
+    try:
+        held = bus.arm(5, 12, command_rate_hz=30.0)
+        assert held[-1] == canonical
+        assert sdk.registers[7, bus_module.GOAL_POSITION] == raw_gripper & 0xffffffff
+        assert bus.position_limits[-1] == (3180, 4376)
+        target = held[:-1] + (4376,)
+        bus.write_positions(target)
+        words = {call.args[0]: int.from_bytes(bytes(call.args[1]), 'little')
+                 for call in sdk.writer.addParam.call_args_list}
+        assert words[7] == (raw_gripper + 4376-canonical) & 0xffffffff
+        assert sdk.registers[6, bus_module.OPERATING_MODE] == 3
+        for invalid in (held[:5] + (4096, held[-1]), held[:-1] + (3179,), held[:-1] + (4377,)):
+            with pytest.raises(ValueError):
+                bus.write_positions(invalid)
+        # While enabled, the offset is fixed even when the hardware crosses 0.
+        sdk.positions[7] = (raw_gripper + 4096-canonical) & 0xffffffff
+        assert bus.read_positions()[-1] == 4096
+        # A sudden counter reset must fault, not normalize into another turn.
+        sdk.positions[7] = (raw_gripper-canonical+100) & 0xffffffff
+        with pytest.raises(RuntimeError, match='possible counter reset'):
+            bus.read_positions()
+    finally:
+        bus.disarm()
+        bus.close()
+
+
+def test_wrapped_gripper_requires_mode4_without_changing_joint_modes(sdk):
+    ids = seven_motors(sdk)
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, ids, gripper_wrap_limits=(3180, 4376))
+    with pytest.raises(RuntimeError, match=r'Extended Position Control Mode \(4\)'):
+        bus.arm(5, 12, command_rate_hz=30.0)
+    assert not sdk.events
+    bus.close()
+
+
+def test_final_goal_readback_retries_dropped_sync_write_without_changing_target(sdk):
+    ids = (1, 2, 3)
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, ids)
+    frames = []
+    def send():
+        targets = {call.args[0]: int.from_bytes(bytes(call.args[1]), 'little')
+                   for call in sdk.writer.addParam.call_args_list[-3:]}
+        frames.append(targets)
+        if len(frames) > 1:
+            for mid, tick in targets.items():
+                sdk.registers[mid, bus_module.GOAL_POSITION] = tick
+        return 0
+    sdk.writer.txPacket.side_effect = send
+    bus.write_verified_positions((3819, 989, 2013))
+    assert frames == [{1: 3819, 2: 989, 3: 2013}]*2
+    sdk.writer.txPacket.side_effect = None
+    sdk.registers[3, bus_module.GOAL_POSITION] = 0
+    with pytest.raises(RuntimeError, match='Final position goals were not accepted'):
+        bus.write_verified_positions((3819, 989, 2013))
+    assert not sdk.events  # No torque, profile or EEPROM changes.
+    bus.close()
+
+
+def test_verified_wrapped_final_goal_reads_back_the_same_hardware_branch(sdk):
+    ids = seven_motors(sdk)
+    sdk.positions[7] = 100
+    sdk.registers[7, bus_module.OPERATING_MODE] = 4
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, ids, gripper_wrap_limits=(3180, 4376))
+    held = bus.arm(5, 12, command_rate_hz=30.0)
+    def send():
+        for call in sdk.writer.addParam.call_args_list[-7:]:
+            sdk.registers[call.args[0], bus_module.GOAL_POSITION] = int.from_bytes(bytes(call.args[1]), 'little')
+        return 0
+    sdk.writer.txPacket.side_effect = send
+    bus.write_verified_positions(held[:-1]+(4376,))
+    assert sdk.registers[7, bus_module.GOAL_POSITION] == 280
+    assert sdk.writer.txPacket.call_count == 1
+    bus.disarm()
+    bus.close()
+
+
 @pytest.mark.parametrize('small_model', [1000, 1020])
 def test_rewired_feedback_and_j4_goal_use_physical_motor_ids(sdk, small_model):
     model = ArmModel({'expected_model_numbers': [1120]*3 + [small_model]*4})
-    assert model.ids == (1, 2, 3, 5, 4, 11, 7)  # ID7 remains an unmeasured placeholder.
-    sdk.positions.update({1: 3923, 2: 1061, 3: 2105, 4: 2004, 5: 2055, 11: 2111, 7: 2200})
+    assert model.ids == (1, 2, 3, 5, 4, 11, 12)
+    sdk.positions.update({1: 3923, 2: 1061, 3: 2105, 4: 2004, 5: 2055, 11: 2111, 12: 3550})
     sdk.packet.ping.side_effect = lambda port, motor_id: (
         1120 if motor_id <= 3 else small_model, 0, 0)
     bus = bus_module.DynamixelBus('/fake/port', 1000000, model.ids)
     try:
         assert bus.models == model.models
         raw = bus.read_positions()
-        assert raw == (3923, 1061, 2105, 2055, 2004, 2111, 2200)
+        assert raw == (3923, 1061, 2105, 2055, 2004, 2111, 3550)
         assert not sdk.events  # Startup and feedback do not write registers.
         bus.write_positions(model.encode(model.decode(raw)))
         before = {call.args[0]: int.from_bytes(bytes(call.args[1]), 'little')
@@ -250,7 +333,7 @@ def test_rewired_feedback_and_j4_goal_use_physical_motor_ids(sdk, small_model):
         target[3] += 10 * RADIANS_PER_TICK
         bus.write_positions(model.encode(target))
         calls = sdk.writer.addParam.call_args_list
-        assert [call.args[0] for call in calls] == [1, 2, 3, 5, 4, 11, 7]
+        assert [call.args[0] for call in calls] == [1, 2, 3, 5, 4, 11, 12]
         after = {call.args[0]: int.from_bytes(bytes(call.args[1]), 'little') for call in calls}
         assert {motor_id for motor_id in before if before[motor_id] != after[motor_id]} == {5}
         assert after[5] == before[5] + 10

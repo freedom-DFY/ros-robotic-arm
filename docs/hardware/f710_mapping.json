@@ -1,0 +1,86 @@
+{
+  "device": "Logitech F710 Gamepad (XInput)",
+  "driver": "joy_node",
+  "topic": "/joy",
+  "required_mode": "Keep the exact MODE state used during this capture; left stick axes 6/7 and D-pad axis 1 confirmed by user",
+  "updated_at": "2026-11-27T23:06:56+08:00",
+  "complete": true,
+  "axes_count": 8,
+  "buttons_count": 11,
+  "baseline_axes": [
+    -0.0,
+    -0.0,
+    1.0,
+    -0.0,
+    -0.0,
+    1.0,
+    0.0,
+    0.0
+  ],
+  "mapping": {
+    "left_stick_up": {
+      "kind": "axis",
+      "index": 7,
+      "baseline": 0.0,
+      "active_value": 1.0,
+      "delta": 1.0,
+      "sign": 1
+    },
+    "left_stick_right": {
+      "kind": "axis",
+      "index": 6,
+      "baseline": 0.0,
+      "active_value": 1.0,
+      "delta": 1.0,
+      "sign": 1
+    },
+    "right_stick_up": {
+      "kind": "axis",
+      "index": 4,
+      "baseline": -0.0,
+      "active_value": 1.0,
+      "delta": 1.0,
+      "sign": 1
+    },
+    "right_stick_right": {
+      "kind": "axis",
+      "index": 3,
+      "baseline": -0.0,
+      "active_value": -1.0,
+      "delta": -1.0,
+      "sign": -1
+    },
+    "dpad_up": {
+      "kind": "axis",
+      "index": 1,
+      "baseline": -0.0,
+      "active_value": 1.0,
+      "delta": 1.0,
+      "sign": 1
+    },
+    "dpad_down": {
+      "kind": "axis",
+      "index": 1,
+      "baseline": -0.0,
+      "active_value": -1.0,
+      "delta": -1.0,
+      "sign": -1
+    },
+    "lb": {
+      "kind": "button",
+      "index": 4,
+      "pressed_value": 1
+    },
+    "a": {
+      "kind": "button",
+      "index": 0,
+      "pressed_value": 1
+    },
+    "b": {
+      "kind": "button",
+      "index": 1,
+      "pressed_value": 1
+    }
+  },
+  "physical_controls_confirmed_by_user": true
+}

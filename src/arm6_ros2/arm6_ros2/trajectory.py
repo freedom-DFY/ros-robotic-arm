@@ -19,6 +19,8 @@ class Plan:
         for index, target in enumerate(targets):
             target = vector(target, 7, 'waypoint').copy()
             model.encode(target)
+            # Joints are bounded coordinates, including ID11 at 0..4095 ticks.
+            # Never wrap a delta modulo 2*pi: 4095 -> 0 traverses the interval.
             delta = np.abs(target-self.points[-1])
             # Max derivatives of 10s^3-15s^4+6s^5 on [0,1].
             minimum = max(float(np.max(1.875*delta/model.velocity)),

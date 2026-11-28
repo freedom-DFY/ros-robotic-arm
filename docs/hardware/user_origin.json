@@ -1,0 +1,21 @@
+{
+  "origin_ticks": [
+    3449,
+    1227,
+    1416,
+    1117,
+    1298,
+    2525
+  ],
+  "motor_ids": [
+    1,
+    2,
+    3,
+    5,
+    4,
+    11
+  ],
+  "reference": "User-taught current physical pose, independent of CAD",
+  "captured_at": "2026-11-27T22:56:29+08:00",
+  "scope": "Applied to running controller and saved in Python/YAML defaults"
+}

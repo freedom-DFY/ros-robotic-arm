@@ -20,7 +20,7 @@ from std_msgs.msg import Float64, Int32MultiArray, String
 from std_srvs.srv import SetBool, Trigger
 
 from arm6_ros2.config import DEFAULTS
-from arm6_ros2.model import ArmModel, JOINT_NAMES, pose_matrix, quaternion_from_matrix, vector
+from arm6_ros2.model import ArmModel, JOINT_NAMES, RADIANS_PER_TICK, pose_matrix, quaternion_from_matrix, vector
 from arm6_ros2.trajectory import Plan, trajectory_request
 
 
@@ -31,6 +31,7 @@ class Controller(Node):
         self.bus = None
         self.closed = False
         self.active = None
+        self.calibration_jog = None
         self.reservation = None
         self.enabled = False
         self.state = 'read_only'
@@ -51,23 +52,41 @@ class Controller(Node):
         for name, default in DEFAULTS.items():
             self.declare_parameter(name, default, ParameterDescriptor(read_only=True))
         self.p = {name: self.get_parameter(name).value for name in DEFAULTS}
+        self.user_origin_ticks = tuple(self.p['home_ticks'])
         self.model = ArmModel(self.p)
         self._validate_settings()
         self.frame = self.p['base_frame']
         from arm6_ros2.dynamixel_bus import DynamixelBus
-        self.bus = DynamixelBus(self.p['device'], self.p['baud_rate'], self.model.ids)
+        self.bus = DynamixelBus(
+            self.p['device'], self.p['baud_rate'], self.model.ids,
+            gripper_wrap_limits=self.model.gripper_limits if self.model.gripper_wraps_zero else None)
         if tuple(self.bus.models) != self.model.models:
             raise ValueError(f'Model mismatch in motor_ids order: expected {self.model.models}, '
                              f'found {self.bus.models}')
         self.joint_pub = self.create_publisher(JointState, '~/joint_states', 10)
         self.pose_pub = self.create_publisher(PoseStamped, '~/tcp_pose', 10)
         self.tick_pub = self.create_publisher(Int32MultiArray, '~/encoder_ticks', 10)
+        self.origin_pub = self.create_publisher(Int32MultiArray, '~/user_origin_ticks', 10)
         self.width_pub = self.create_publisher(Float64, '~/gripper_width', 10)
         self.status_pub = self.create_publisher(String, '~/motion_status', 10)
         self.create_subscription(JointState, '~/joint_target', self.joint_target, 1)
         self.create_subscription(PoseStamped, '~/pose_target', self.pose_target, 1)
         self.create_subscription(Float64, '~/gripper_target', self.gripper_target, 1)
         self.create_service(SetBool, '~/enable', self.enable)
+        for index in range(6):
+            self.create_service(SetBool, f'~/calibration/joint_{index+1}/jog',
+                                lambda request, response, index=index:
+                                self.calibration_jog_request(request, response, index))
+            self.create_service(SetBool, f'~/manual/joint_{index+1}/jog',
+                                lambda request, response, index=index:
+                                self.calibration_jog_request(request, response, index, require_unconfirmed=False))
+        self.create_service(Trigger, '~/set_user_origin', self.set_user_origin)
+        self.create_service(Trigger, '~/home', self.return_home)
+        self.create_service(Trigger, '~/manual/gripper/open',
+                            lambda request, response: self.manual_gripper_request(request, response, True))
+        self.create_service(Trigger, '~/manual/gripper/close',
+                            lambda request, response: self.manual_gripper_request(request, response, False))
+        self.create_service(SetBool, '~/manual/gripper/jog', self.manual_gripper_jog)
         self.create_service(Trigger, '~/stop', self.stop)
         self.create_service(Trigger, '~/gripper/open', self.open_gripper)
         self.create_service(Trigger, '~/gripper/close', self.close_gripper)
@@ -79,13 +98,16 @@ class Controller(Node):
                                       clock=Clock(clock_type=ClockType.STEADY_TIME))
         self.get_logger().info(f'Six-axis arm + ID{self.model.ids[-1]} gripper ready; manual enable required. '
                                f'device={self.p["device"]}, state={self.state}')
+        if self.p['home_on_enable']:
+            self.get_logger().info(f'Enable will return to taught home ticks={self.p["home_ticks"]}; '
+                                   'gripper opening will be held')
 
     def _validate_settings(self):
         positive = ('rate_hz', 'feedback_timeout_s', 'max_tracking_error_rad',
                     'gripper_tracking_error_m', 'arrival_tolerance_rad',
                     'gripper_arrival_tolerance_m', 'settle_time_s', 'arrival_timeout_s',
                     'cartesian_resolution_m', 'cartesian_resolution_rad',
-                    'max_ik_joint_step_rad', 'max_trajectory_duration_s')
+                    'max_ik_joint_step_rad', 'max_trajectory_duration_s', 'home_arrival_tolerance_rad')
         if any(not math.isfinite(self.p[k]) or self.p[k] <= 0 for k in positive):
             raise ValueError('Timing, tolerance and path settings must be positive and finite')
         if (not 5 <= self.p['rate_hz'] <= 100
@@ -99,12 +121,24 @@ class Controller(Node):
         if any(type(self.p[k]) is not int or not 1 <= self.p[k] <= 32767
                for k in ('profile_velocity', 'profile_acceleration')):
             raise ValueError('Register profile values must be positive integers')
+        home = vector(self.p['home_ticks'], 6, 'home_ticks')
+        if (type(self.p['calibration_jog_step_ticks']) is not int
+                or not 1 <= self.p['calibration_jog_step_ticks'] <= 20):
+            raise ValueError('calibration_jog_step_ticks must be an integer from 1 to 20')
+        if (np.any(home != np.round(home)) or np.any(home < self.model.tick_min)
+                or np.any(home > self.model.tick_max)):
+            raise ValueError('home_ticks must be six integer positions inside joint motion limits')
 
-    @staticmethod
-    def _valid_raw(raw):
-        if len(raw) != 7 or any(type(t) is not int or not 0 <= t <= 4095 for t in raw):
-            raise ValueError('Expected seven single-turn encoder integers')
+    def _valid_raw(self, raw):
+        gripper_max = 8191 if self.model.gripper_wraps_zero else 4095
+        if (len(raw) != 7 or any(type(t) is not int or not 0 <= t <= 4095 for t in raw[:6])
+                or type(raw[6]) is not int or not 0 <= raw[6] <= gripper_max):
+            raise ValueError('Expected six single-turn joint integers and a valid gripper encoder')
         return tuple(raw)
+
+    def _unarmed_positions(self, raw):
+        return tuple(t % 4096 for t in raw[:6]) + (
+            raw[6] if self.model.gripper_wraps_zero else raw[6] % 4096,)
 
     def _feedback(self):
         if self.closed or self.measured is None or self.last_feedback is None:
@@ -116,13 +150,19 @@ class Controller(Node):
     def _ready(self, *, cartesian=False):
         if not self.enabled or self.state == 'fault':
             raise ValueError('Enable motion first; faults require disable then enable')
-        if self.active is not None or self.reservation is not None:
+        if self.active is not None or self.calibration_jog is not None or self.reservation is not None:
             raise ValueError('Another motion is active; stop or cancel before a new command')
         current = self._feedback()
         if not self.p['calibration_confirmed']:
-            raise ValueError('Confirm all seven motor calibrations and limits before real movement')
+            raise ValueError('Motor calibrations await manual confirmation (calibration_confirmed=false): '
+                             'verify encoder zeros, directions and limits; independent of home tolerance')
         if cartesian and not self.p['geometry_confirmed']:
-            raise ValueError('Confirm the measured DH model and TCP before real Cartesian movement')
+            raise ValueError('DH model and reference TCP await manual confirmation '
+                             '(geometry_confirmed=false); independent of home tolerance')
+        self._check_motion_bounds(current)
+        return current
+
+    def _check_motion_bounds(self, current):
         if self.bus.position_limits is None:
             raise ValueError('Servo limits have not been read by enable')
         minima = list(self.model.tick_min)+[min(self.model.closed, self.model.opened)]
@@ -131,7 +171,153 @@ class Controller(Node):
                zip(minima, maxima, self.bus.position_limits)):
             raise ValueError('Configured motion limits must lie inside servo register limits')
         self.model.encode(current)  # Motion checks apply after enable-at-current-position.
-        return current
+
+    def _home_plan(self, raw):
+        if not self.p['home_confirmed']:
+            raise ValueError('Confirm the taught home pose before automatic homing')
+        current = self.model.decode(raw)
+        # Preserve the gripper's measured opening, including its reversed direction.
+        target = self.model.decode(self.user_origin_ticks + (raw[6],))
+        return Plan(self.model, current, [target])
+
+    def set_user_origin(self, _request, _response):
+        with self.lock:
+            try:
+                if (not self.enabled or self.state not in ('holding', 'stopped')
+                        or self.active is not None or self.calibration_jog is not None
+                        or self.reservation is not None):
+                    raise ValueError('Set user origin only while enabled and stationary')
+                self._check_motion_bounds(self._feedback())
+                self.user_origin_ticks = tuple(self.measured[:6])
+                self.origin_pub.publish(Int32MultiArray(data=list(self.user_origin_ticks)))
+                return Trigger.Response(success=True, message=str(list(self.user_origin_ticks)))
+            except ValueError as exc:
+                return Trigger.Response(success=False, message=str(exc))
+
+    def return_home(self, _request, _response):
+        with self.lock:
+            try:
+                if (not self.enabled or self.state not in ('holding', 'stopped')
+                        or self.active is not None or self.calibration_jog is not None
+                        or self.reservation is not None):
+                    raise ValueError('Return home requires an enabled stationary arm')
+                current = self._feedback()
+                self._check_motion_bounds(current)
+                plan = self._home_plan(self.measured)
+                tolerance = self.p['home_arrival_tolerance_rad']
+                if np.all(np.abs(current[:6]-plan.points[-1][:6]) <= tolerance):
+                    self.state = 'holding'
+                    return Trigger.Response(success=True, message='Already within user-origin tolerance')
+                self._start(plan, tolerances={'goal': np.full(6, tolerance)})
+                return Trigger.Response(success=True, message='Returning to user origin; gripper opening held')
+            except ValueError as exc:
+                return Trigger.Response(success=False, message=str(exc))
+            except Exception as exc:
+                self._fault(exc)
+                return Trigger.Response(success=False, message=str(exc))
+
+    def calibration_jog_request(self, request, _response, index, require_unconfirmed=True):
+        with self.lock:
+            proposed = None
+            try:
+                if require_unconfirmed and self.p['calibration_confirmed']:
+                    raise ValueError('Calibration jog is only available while encoder calibration is unconfirmed')
+                if (not self.enabled or self.state not in ('holding', 'stopped')
+                        or self.active is not None or self.calibration_jog is not None
+                        or self.reservation is not None):
+                    raise ValueError('Jog requires an enabled, stationary arm without another motion')
+                self._check_motion_bounds(self._feedback())
+                proposed = {'axis': index}
+                self.calibration_jog = proposed
+                # Increment the existing hold goal, so repeated small jogs do not
+                # lose every step to an unmodified P-only controller's load error.
+                initial = self.bus.read_goal_position(index)
+                step = self.p['calibration_jog_step_ticks'] * (1 if request.data else -1)
+                target = initial+step
+                if not (self.model.tick_min[index] <= initial <= self.model.tick_max[index]
+                        and self.model.tick_min[index] <= target <= self.model.tick_max[index]):
+                    raise ValueError('Selected jog would cross the measured motor limits')
+                velocity = min(0.02, self.model.velocity[index])
+                acceleration = min(0.04, self.model.acceleration[index])
+                self._start_manual_axis(index, initial, target, velocity, acceleration)
+                return SetBool.Response(success=True, message=(
+                    f'ID{self.model.ids[index]} goal {initial}->{target}; other hold goals unchanged'))
+            except ValueError as exc:
+                if proposed is not None and self.calibration_jog is proposed:
+                    self.calibration_jog = None
+                return SetBool.Response(success=False, message=str(exc))
+            except Exception as exc:
+                self._fault(exc)
+                return SetBool.Response(success=False, message=str(exc))
+
+    def _start_manual_axis(self, index, initial, target, velocity, acceleration):
+        distance = abs(target-initial)*RADIANS_PER_TICK
+        duration = max(1.875*distance/velocity,
+                       math.sqrt((10/math.sqrt(3))*distance/acceleration), 0.1)*1.01
+        self.calibration_jog = dict(axis=index, initial=initial, target=target, duration=duration,
+                                    started=time.monotonic(), last=initial)
+        self.last_tick = time.monotonic()
+        self.state = 'calibrating'
+
+    def manual_gripper_jog(self, request, _response):
+        result = self.manual_gripper_request(None, None, request.data, step_only=True)
+        return SetBool.Response(success=result.success, message=result.message)
+
+    def manual_gripper_request(self, _request, _response, opened, step_only=False):
+        with self.lock:
+            proposed = None
+            try:
+                if (not self.enabled or self.state not in ('holding', 'stopped')
+                        or self.active is not None or self.calibration_jog is not None
+                        or self.reservation is not None):
+                    raise ValueError('Gripper control requires an enabled stationary arm')
+                self._check_motion_bounds(self._feedback())
+                proposed = {'axis': 6}
+                self.calibration_jog = proposed
+                initial = self.bus.read_goal_position(6)
+                target = self.model.opened if opened else self.model.closed
+                lo, hi = self.model.gripper_limits
+                if not lo <= initial <= hi:
+                    raise ValueError('Gripper hold goal is outside the measured gripper range')
+                if step_only:
+                    step = self.p['calibration_jog_step_ticks']
+                    target = initial+max(-step, min(step, target-initial))
+                    if target == initial:
+                        raise ValueError('Gripper already at the measured endpoint')
+                self._start_manual_axis(6, initial, target, 0.05, 0.05)
+                return Trigger.Response(success=True, message=(
+                    f'Gripper goal {initial}->{target}; six arm hold goals unchanged'))
+            except ValueError as exc:
+                if proposed is not None and self.calibration_jog is proposed:
+                    self.calibration_jog = None
+                return Trigger.Response(success=False, message=str(exc))
+            except Exception as exc:
+                self._fault(exc)
+                return Trigger.Response(success=False, message=str(exc))
+
+    def _step_calibration_jog(self, now):
+        jog = self.calibration_jog
+        index = jog['axis']
+        measured = self.measured[index]
+        lo, hi = (self.model.gripper_limits if index == 6 else
+                  (self.model.tick_min[index], self.model.tick_max[index]))
+        if not lo <= measured <= hi:
+            raise RuntimeError('Calibration feedback crossed the measured motor limit')
+        if abs(measured-jog['last'])*RADIANS_PER_TICK > self.p['max_tracking_error_rad']:
+            raise RuntimeError('Calibration tracking error exceeded the configured limit')
+        elapsed = now-jog['started']
+        fraction = min(1.0, max(0.0, elapsed/jog['duration']))
+        smooth = fraction**3*(10+fraction*(-15+fraction*6))
+        tick = round(jog['initial']+smooth*(jog['target']-jog['initial']))
+        if tick != jog['last']:
+            self.bus.write_single_position(index, tick)
+            jog['last'] = tick
+        if elapsed >= jog['duration']+0.3:
+            self.bus.write_single_position(index, jog['target'])
+            self.get_logger().info(f'Calibration jog ID{self.model.ids[index]} finished: '
+                                   f'goal={jog["target"]}, feedback={measured}; record actual feedback')
+            self.calibration_jog = None
+            self.state = 'holding'
 
     def _start(self, plan, *, handle=None, future=None, tolerances=None):
         # Planning can take longer than one feedback period. Never execute a
@@ -286,6 +472,7 @@ class Controller(Node):
             active['future'].set_result((code, message, outcome))
 
     def _hold(self, message='Stopped', outcome='aborted'):
+        jog, self.calibration_jog = self.calibration_jog, None
         self.reservation = None
         self._finish(-1, message, outcome)
         if self.enabled:
@@ -293,7 +480,10 @@ class Controller(Node):
             if self.bus.position_limits is None or any(
                     not lo <= t <= hi for t, (lo, hi) in zip(raw, self.bus.position_limits)):
                 raise RuntimeError('Cannot confirm a hold target inside servo register limits')
-            self.bus.write_positions(raw)
+            if jog is not None:
+                self.bus.write_single_position(jog['axis'], raw[jog['axis']])
+            else:
+                self.bus.write_positions(raw)
             self.measured = raw
             self.last_feedback = time.monotonic()
             self.last_written = self.measured
@@ -314,6 +504,7 @@ class Controller(Node):
             if self.closed:
                 return SetBool.Response(success=False, message='Controller is closed')
             if not request.data:
+                self.calibration_jog = None
                 self.reservation = None
                 self._finish(-1, 'Disabled', 'aborted')
                 self.enabled = False
@@ -325,6 +516,11 @@ class Controller(Node):
                     raise ValueError('Clear fault with enable false before enable true')
                 if self.enabled:
                     return SetBool.Response(success=True, message='Already enabled')
+                if self.p['home_on_enable']:
+                    # Reject unknown homes, out-of-bounds starts and invalid plans
+                    # before writing a hold goal or enabling any motor.
+                    raw = self._valid_raw(self._unarmed_positions(self.bus.read_positions()))
+                    self._home_plan(raw)
                 self.measured = self._valid_raw(self.bus.arm(
                     self.p['profile_acceleration'], self.p['profile_velocity'],
                     command_rate_hz=self.p['rate_hz']))
@@ -332,9 +528,25 @@ class Controller(Node):
                 self.last_written = self.measured
                 self.enabled = True
                 self.state = 'holding'
+                if self.p['home_on_enable']:
+                    current = self.model.decode(self.measured)
+                    self._check_motion_bounds(current)
+                    # Re-plan from the actual torque-on position, never a stale sample.
+                    plan = self._home_plan(self.measured)
+                    tolerance = self.p['home_arrival_tolerance_rad']
+                    if np.all(np.abs(current[:6]-plan.points[-1][:6]) <= tolerance):
+                        return SetBool.Response(success=True, message=(
+                            'Within taught home tolerance; holding measured position, gripper opening held'))
+                    self._start(plan, tolerances={'goal': np.full(6, tolerance)})
+                    return SetBool.Response(success=True, message=(
+                        'Enabled; returning to taught home, gripper opening held. '
+                        'Wait for motion_status=holding'))
                 return SetBool.Response(success=True, message='Holding measured position; no automatic homing')
             except Exception as exc:
-                self.state = 'fault'
+                if self.enabled:
+                    self._fault(exc)
+                else:
+                    self.state = 'fault'
                 return SetBool.Response(success=False, message=str(exc))
 
     def _fault(self, exc, code=-4):
@@ -358,10 +570,11 @@ class Controller(Node):
                 return
             try:
                 now = time.monotonic()
-                if self.active and self.last_tick is not None and now-self.last_tick > self.p['feedback_timeout_s']:
+                if ((self.active or self.calibration_jog) and self.last_tick is not None
+                        and now-self.last_tick > self.p['feedback_timeout_s']):
                     raise RuntimeError('Control loop missed its feedback deadline')
                 raw = self.bus.read_positions()
-                raw = self._valid_raw(raw if self.enabled else tuple(t % 4096 for t in raw))
+                raw = self._valid_raw(raw if self.enabled else self._unarmed_positions(raw))
                 self.measured = raw
                 if self.enabled and now-self.last_health_check >= 1.0:
                     errors = self.bus.read_hardware_errors()
@@ -373,7 +586,9 @@ class Controller(Node):
                     raise RuntimeError('Serial feedback transaction exceeded its deadline')
                 self.last_feedback = time.monotonic()
                 self.last_tick = self.last_feedback
-                if self.active:
+                if self.calibration_jog is not None:
+                    self._step_calibration_jog(self.last_feedback)
+                elif self.active:
                     self._step(self.last_feedback)
                 if self.measured is not None:
                     self._publish()
@@ -411,6 +626,11 @@ class Controller(Node):
                 point.time_from_start.nanosec = int((elapsed-int(elapsed))*1e9)
             active['handle'].publish_feedback(feedback)
         if elapsed >= plan.duration:
+            if not active.get('final_goal_verified', False):
+                # SyncWrite has no per-motor acknowledgement. Confirm the final
+                # target before relying on a passive arrival wait.
+                self.bus.write_verified_positions(ticks)
+                active['final_goal_verified'] = True
             error = np.abs(current-plan.points[-1])
             within = (np.all(error[:6] <= active['goal_tolerance'])
                       and error[6] <= self.p['gripper_arrival_tolerance_m'])
@@ -442,6 +662,7 @@ class Controller(Node):
         self.joint_pub.publish(joints)
         self.pose_pub.publish(pose)
         self.tick_pub.publish(Int32MultiArray(data=list(self.measured)))
+        self.origin_pub.publish(Int32MultiArray(data=list(self.user_origin_ticks)))
         self.width_pub.publish(Float64(data=float(q[6])))
 
     def close(self):
@@ -450,6 +671,7 @@ class Controller(Node):
                 return
             self.closed = True
             self.reservation = None
+            self.calibration_jog = None
             self._finish(-1, 'Controller shutting down', 'aborted')
             if hasattr(self, 'timer'):
                 self.timer.cancel()
