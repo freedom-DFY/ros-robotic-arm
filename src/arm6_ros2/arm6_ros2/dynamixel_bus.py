@@ -9,11 +9,13 @@ TIME_BASED_PROFILE = 0x04
 TORQUE_ON_BY_GOAL_UPDATE = 0x08
 OPERATING_MODE = 11
 HOMING_OFFSET = 20
+PWM_LIMIT = 36
 MAX_POSITION_LIMIT = 48
 MIN_POSITION_LIMIT = 52
 TORQUE_ENABLE = 64
 HARDWARE_ERROR = 70
 BUS_WATCHDOG = 98
+GOAL_PWM = 100
 PROFILE_ACCELERATION = 108
 PROFILE_VELOCITY = 112
 GOAL_POSITION = 116
@@ -55,16 +57,25 @@ class DynamixelBus:
         if result != COMM_SUCCESS:
             raise RuntimeError("DXL {}: {}".format(motor_id, self.packet.getTxRxResult(result)))
         if error:
-            raise RuntimeError("DXL {}: {}".format(motor_id, self.packet.getRxPacketError(error)))
+            detail = self.packet.getRxPacketError(error)
+            if isinstance(motor_id, int) and error & 0x80:
+                status, result, reply_error = self.packet.read1ByteTxRx(self.port, motor_id, HARDWARE_ERROR)
+                if result == COMM_SUCCESS and reply_error in (0, 0x80):
+                    detail += f' Hardware Error Status=0x{status:02x}.'
+            raise RuntimeError(f'DXL {motor_id}: {detail}')
 
     def _read(self, motor_id, address, size=1):
-        read = self.packet.read1ByteTxRx if size == 1 else self.packet.read4ByteTxRx
+        read = {1: self.packet.read1ByteTxRx, 2: self.packet.read2ByteTxRx,
+                4: self.packet.read4ByteTxRx}[size]
         value, result, error = read(self.port, motor_id, address)
+        if address == HARDWARE_ERROR and result == COMM_SUCCESS and error == 0x80:
+            return value  # Alert bit accompanies the requested status payload.
         self._check(motor_id, result, error)
         return value
 
     def _write(self, motor_id, address, value, size=1):
-        write = self.packet.write1ByteTxRx if size == 1 else self.packet.write4ByteTxRx
+        write = {1: self.packet.write1ByteTxRx, 2: self.packet.write2ByteTxRx,
+                 4: self.packet.write4ByteTxRx}[size]
         result, error = write(self.port, motor_id, address, value)
         self._check(motor_id, result, error)
 
@@ -138,7 +149,7 @@ class DynamixelBus:
             .format(motor_id, tick, observed, ', '.join(diagnostics))
         )
 
-    def arm(self, acceleration, velocity, *, command_rate_hz):
+    def arm(self, acceleration, velocity, *, command_rate_hz, gripper_goal_pwm_limit=None):
         """Enable torque at the measured position, independently of software motion bounds."""
         if self.possibly_enabled:
             raise RuntimeError("Disable the previous arm session first")
@@ -188,6 +199,18 @@ class DynamixelBus:
                 raise RuntimeError("Motor {} current position {} is outside the servo's internal limits {}..{}"
                                    .format(motor_id, tick, lo, hi))
         self.position_limits = tuple(limits)
+        if gripper_goal_pwm_limit is not None:
+            if len(self.ids) != 7 or type(gripper_goal_pwm_limit) is not int or not 1 <= gripper_goal_pwm_limit <= 885:
+                raise ValueError('Invalid gripper PWM limit')
+            motor_id = self.ids[-1]
+            pwm = min(gripper_goal_pwm_limit, self._read(motor_id, PWM_LIMIT, 2))
+            if pwm <= 0:
+                raise RuntimeError(f'Motor {motor_id} has zero PWM Limit')
+            # Goal PWM is a RAM output limit in the existing position mode.
+            # Verify it before enabling any motor. Leave EEPROM unchanged.
+            self._write(motor_id, GOAL_PWM, pwm, 2)
+            if self._read(motor_id, GOAL_PWM, 2) != pwm:
+                raise RuntimeError(f'Motor {motor_id} did not accept its Goal PWM limit')
         try:
             for index, (motor_id, tick, (accel, speed_or_time)) in enumerate(zip(self.ids, present, profiles)):
                 self._write(motor_id, PROFILE_ACCELERATION, accel, 4)
@@ -208,12 +231,16 @@ class DynamixelBus:
                                    .format(exc, "; ".join(failures))) from exc
             raise
 
-    def write_positions(self, ticks):
+    def write_positions(self, ticks, *, indices=None):
         if len(ticks) != len(self.ids):
             raise ValueError('Expected one integer target for every motor')
-        goals = [self._goal_word(index, tick) for index, tick in enumerate(ticks)]
+        selected = tuple(range(len(self.ids))) if indices is None else tuple(indices)
+        if (not selected or any(type(i) is not int or not 0 <= i < len(self.ids) for i in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError('Expected distinct motor indices for sync write')
+        goals = [(self.ids[i], self._goal_word(i, ticks[i])) for i in selected]
         try:
-            for motor_id, tick in zip(self.ids, goals):
+            for motor_id, tick in goals:
                 if not self.writer.addParam(motor_id, list(tick.to_bytes(4, "little"))):
                     raise RuntimeError("Failed to add motor {} to sync write".format(motor_id))
             self._check("sync write", self.writer.txPacket())
@@ -235,14 +262,14 @@ class DynamixelBus:
             tick -= self.gripper_offset
         return tick
 
-    def write_single_position(self, index, tick):
-        """Acknowledged calibration jog; never rewrite the other hold goals."""
+    def write_single_position(self, index, tick, *, verify=True):
+        """Send an acknowledged goal to one motor, with optional register readback."""
         if type(index) is not int or not 0 <= index < len(self.ids):
             raise ValueError('Invalid selected motor')
         goal = self._goal_word(index, tick)
         mid = self.ids[index]
         self._write(mid, GOAL_POSITION, goal, 4)
-        if self._read(mid, GOAL_POSITION, 4) != goal:
+        if verify and self._read(mid, GOAL_POSITION, 4) != goal:
             raise RuntimeError(f'Motor {mid} did not accept calibration goal {tick}')
 
     def write_verified_positions(self, ticks):

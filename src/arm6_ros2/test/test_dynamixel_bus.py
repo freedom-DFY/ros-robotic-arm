@@ -34,7 +34,7 @@ def sdk(monkeypatch):
             bus_module.DRIVE_MODE: 4, bus_module.HOMING_OFFSET: 0,
             bus_module.MIN_POSITION_LIMIT: 0, bus_module.MAX_POSITION_LIMIT: 4095,
             bus_module.HARDWARE_ERROR: 0, bus_module.GOAL_POSITION: 0,
-            bus_module.BUS_WATCHDOG: 0,
+            bus_module.BUS_WATCHDOG: 0, bus_module.PWM_LIMIT: 885, bus_module.GOAL_PWM: 885,
             bus_module.PRESENT_POSITION: positions[motor_id],
         }.items():
             registers[motor_id, address] = value
@@ -49,8 +49,10 @@ def sdk(monkeypatch):
         return 0, 0
 
     packet.read1ByteTxRx.side_effect = read
+    packet.read2ByteTxRx.side_effect = read
     packet.read4ByteTxRx.side_effect = read
     packet.write1ByteTxRx.side_effect = write
+    packet.write2ByteTxRx.side_effect = write
     packet.write4ByteTxRx.side_effect = write
     monkeypatch.setattr(bus_module, 'PortHandler', lambda device: port)
     monkeypatch.setattr(bus_module, 'PacketHandler', lambda protocol: packet)
@@ -72,6 +74,25 @@ def test_enable_preloads_actual_positions_before_any_torque_on(sdk):
     assert bus.possibly_enabled == {1, 2, 3}
     assert not bus.disarm()
     bus.close()
+
+
+def test_partial_sync_write_only_addresses_selected_motors(sdk):
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, (1, 2, 3))
+    bus.write_positions((3800, 1000, 2050), indices=(0, 2))
+    assert [call.args[0] for call in sdk.writer.addParam.call_args_list] == [1, 3]
+    sdk.writer.txPacket.assert_called_once()
+    sdk.writer.clearParam.assert_called_once()
+
+
+def test_streamed_single_motor_write_requires_ack_but_skips_goal_readback(sdk):
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, (1, 2, 3))
+    bus.write_single_position(2, 2050, verify=False)
+    assert sdk.events == [(3, bus_module.GOAL_POSITION, 2050)]
+    sdk.packet.read4ByteTxRx.assert_not_called()
+    sdk.packet.write4ByteTxRx.side_effect = None
+    sdk.packet.write4ByteTxRx.return_value = (-1, 0)
+    with pytest.raises(RuntimeError, match='communication error'):
+        bus.write_single_position(2, 2051, verify=False)
 
 
 @pytest.mark.parametrize('address,value', [
@@ -226,6 +247,38 @@ def test_seventh_motor_enable_failure_rolls_back_all_seven(sdk):
     assert not bus.possibly_enabled
     assert all(sdk.registers[motor_id, bus_module.TORQUE_ENABLE] == 0 for motor_id in ids)
     bus.close()
+
+
+@pytest.mark.parametrize('hardware_limit,expected', [(885, 132), (90, 90)])
+def test_gripper_pwm_is_bounded_and_verified_before_torque(sdk, hardware_limit, expected):
+    ids = seven_motors(sdk)
+    sdk.registers[7, bus_module.PWM_LIMIT] = hardware_limit
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, ids)
+    bus.arm(5, 12, command_rate_hz=30., gripper_goal_pwm_limit=132)
+    first_torque = next(i for i, (_, address, _) in enumerate(sdk.events) if address == bus_module.TORQUE_ENABLE)
+    assert (7, bus_module.GOAL_PWM, expected) in sdk.events[:first_torque]
+    assert [(motor, value) for motor, address, value in sdk.events if address == bus_module.GOAL_PWM] == [(7, expected)]
+    assert not any(address == bus_module.PWM_LIMIT for _, address, _ in sdk.events)
+
+
+def test_gripper_pwm_readback_failure_prevents_enable(sdk):
+    ids = seven_motors(sdk)
+    sdk.packet.write2ByteTxRx.side_effect = None
+    sdk.packet.write2ByteTxRx.return_value = (0, 0)
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, ids)
+    with pytest.raises(RuntimeError, match='Goal PWM limit'):
+        bus.arm(5, 12, command_rate_hz=30., gripper_goal_pwm_limit=132)
+    assert not bus.possibly_enabled and not any(address == bus_module.TORQUE_ENABLE for _, address, _ in sdk.events)
+
+
+def test_motor_alert_logs_underlying_hardware_error_bits(sdk):
+    bus = bus_module.DynamixelBus('/fake/port', 1000000, (1, 2, 3))
+    sdk.packet.write4ByteTxRx.side_effect = None
+    sdk.packet.write4ByteTxRx.return_value = (0, 0x80)
+    sdk.packet.read1ByteTxRx.side_effect = lambda port, mid, addr: (0x20, 0, 0x80)
+    with pytest.raises(RuntimeError, match='Hardware Error Status=0x20'):
+        bus.write_single_position(2, 2050, verify=False)
+    sdk.packet.read1ByteTxRx.assert_called_once_with(sdk.port, 3, bus_module.HARDWARE_ERROR)
 
 
 @pytest.mark.parametrize('raw_gripper,canonical', [(3550, 3550), (100, 4196),

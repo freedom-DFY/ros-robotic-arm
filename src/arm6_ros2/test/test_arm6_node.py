@@ -1,6 +1,7 @@
 """Hardware controller tests using an injected fake bus; never open a serial port."""
 
 import os
+from pathlib import Path
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,12 +15,12 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import GoalResponse
 from rclpy.context import Context
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Joy
 from std_msgs.msg import Float64
 from std_srvs.srv import SetBool, Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from arm6_ros2.config import DEFAULTS
+from arm6_ros2.config import DEFAULTS, load_parameters
 from arm6_ros2.model import ArmModel, JOINT_NAMES, quaternion_from_matrix
 from arm6_ros2.node import Controller
 from arm6_ros2.trajectory import Plan
@@ -28,7 +29,7 @@ from arm6_ros2.trajectory import Plan
 @pytest.fixture
 def controller(monkeypatch):
     context = Context()
-    rclpy.init(context=context)
+    rclpy.init(context=context, domain_id=183)
     from arm6_ros2 import dynamixel_bus
     monkeypatch.setattr(dynamixel_bus, 'DynamixelBus',
                         lambda device, baud, ids, **options: FakeBus([3923, 1061, 2105, 2048, 2300, 2048, 3550]))
@@ -332,22 +333,41 @@ def test_invalid_trajectory_goals_rejected(controller, change):
 class FakeBus:
     def __init__(self, raw):
         self.raw = tuple(raw)
+        self.goals = self.raw
         self.position_limits = ((0, 4095),)*6 + (ArmModel().gripper_limits,)
         self.writes = []
         self.models = tuple(DEFAULTS['expected_model_numbers'])
         self.follow_commands = True
         self.load_error = [0]*7
 
-    def arm(self, acceleration, velocity, *, command_rate_hz):
+    def arm(self, acceleration, velocity, *, command_rate_hz, gripper_goal_pwm_limit=None):
+        self.goals = self.raw
         return self.raw
 
     def read_positions(self):
         return self.raw
 
-    def write_positions(self, raw):
+    def write_positions(self, raw, *, indices=None):
+        selected = range(len(raw)) if indices is None else indices
+        selected = set(selected)
+        self.goals = tuple(raw[i] if i in selected else goal for i, goal in enumerate(self.goals))
         if self.follow_commands:
-            self.raw = tuple(tick-error for tick, error in zip(raw, self.load_error))
-        self.writes.append(tuple(raw))
+            self.raw = tuple(self.goals[i]-self.load_error[i] if i in selected else tick
+                             for i, tick in enumerate(self.raw))
+        self.writes.append(self.goals)
+
+    def read_goal_position(self, index):
+        return self.goals[index]
+
+    def write_single_position(self, index, tick, *, verify=True):
+        goals = list(self.goals)
+        goals[index] = tick
+        self.goals = tuple(goals)
+        if self.follow_commands:
+            raw = list(self.raw)
+            raw[index] = tick-self.load_error[index]
+            self.raw = tuple(raw)
+        self.writes.append(self.goals)
 
     def read_hardware_errors(self):
         return (0,)*7
@@ -379,6 +399,160 @@ def test_real_motion_gates_calibration_and_geometry(controller):
     node.bus.position_limits = ((0, 4095),)*6+((3400, 3700),)
     with pytest.raises(ValueError, match='register limits'):
         node._ready()
+
+
+@pytest.mark.parametrize('axis', range(3))
+@pytest.mark.parametrize('positive', [False, True])
+def test_cartesian_jog_translates_wrist_and_preserves_orientation_and_gripper(controller, axis, positive):
+    node = controller
+    enable(node)
+    # The controlled point is frame 6 even after a tool has been calibrated.
+    node.model.tcp[:3, 3] = [0.02, -0.01, 0.04]
+    current = node.model.decode(node.measured)
+    before = node.model.chain(current[:6])[-1]
+    result = node.cartesian_jog_request(SetBool.Request(data=positive), None, axis)
+    assert result.success, result.message
+    assert node.state == 'moving'
+    target = node.active['plan'].points[-1]
+    after = node.model.chain(target[:6])[-1]
+    delta = np.zeros(3)
+    delta[axis] = 0.001 * (1 if positive else -1)
+    assert np.allclose(after[:3, 3]-before[:3, 3], delta, atol=1e-5)
+    assert np.allclose(after[:3, :3], before[:3, :3], atol=1e-4)
+    assert target[6] == current[6]
+    finish(node)
+
+
+@pytest.mark.parametrize('case', ['disabled', 'calibration', 'geometry', 'busy', 'ik', 'stale'])
+def test_cartesian_jog_rejects_without_replacing_motion_or_writing(controller, case):
+    node = controller
+    if case != 'disabled':
+        enable(node)
+    if case == 'calibration':
+        node.p['calibration_confirmed'] = False
+    elif case == 'geometry':
+        node.p['geometry_confirmed'] = False
+    elif case == 'busy':
+        node.open_gripper(None, None)
+    elif case == 'ik':
+        node.model.cartesian_path = MagicMock(side_effect=ValueError('No continuous IK solution'))
+    elif case == 'stale':
+        node.last_feedback = time.monotonic()-1.
+    active = node.active
+    writes = list(node.bus.writes)
+    result = node.cartesian_jog_request(SetBool.Request(data=True), None, 0)
+    assert not result.success
+    assert node.active is active
+    assert node.bus.writes == writes
+    assert node.state != 'fault'
+
+
+def test_cartesian_jog_stop_freezes_existing_goal(controller):
+    node = controller
+    enable(node)
+    assert node.cartesian_jog_request(SetBool.Request(data=True), None, 0).success
+    goal = node.last_written
+    writes = list(node.bus.writes)
+    assert node.stop(None, None).success
+    assert node.active is None and node.state == 'stopped'
+    assert node.last_written == goal
+    assert node.bus.writes == writes
+
+
+@pytest.mark.parametrize('axis', range(3))
+@pytest.mark.parametrize('positive', [False, True])
+def test_gamepad_cartesian_jog_is_faster_without_changing_other_trajectory_limits(controller, axis, positive):
+    node = controller
+    enable(node)
+    original_velocity = node.model.velocity.copy()
+    original_acceleration = node.model.acceleration.copy()
+    before = node.model.chain(node.model.decode(node.measured)[:6])[-1]
+    response = node.cartesian_jog_request(SetBool.Request(data=positive), None, axis, gamepad=True)
+    assert response.success, response.message
+    plan = node.active['plan']
+    after = node.model.chain(plan.points[-1][:6])[-1]
+    delta = np.zeros(3)
+    delta[axis] = node.p['gamepad_cartesian_step_m']*(1 if positive else -1)
+    assert np.allclose(after[:3, 3]-before[:3, 3], delta, atol=1e-5)
+    assert np.allclose(after[:3, :3], before[:3, :3], atol=1e-4)
+    ordinary = Plan(node.model, plan.start, plan.points[1:])
+    assert plan.duration < ordinary.duration*0.7
+    assert np.array_equal(node.model.velocity, original_velocity)
+    assert np.array_equal(node.model.acceleration, original_acceleration)
+    assert node.active['settle_time'] == node.p['gamepad_settle_time_s']
+    finish(node)
+
+
+@pytest.mark.parametrize('axis', [5, 6])
+def test_gamepad_rotation_and_gripper_have_higher_throughput_than_manual_jogs(controller, axis):
+    node = controller
+    enable(node)
+    node.bus.read_goal_position = lambda index: node.last_written[index]
+    request = SetBool.Request(data=True)
+
+    def jog(gamepad):
+        if axis == 6:
+            return node.manual_gripper_jog(request, None, gamepad=gamepad)
+        return node.calibration_jog_request(request, None, 5, require_unconfirmed=False, gamepad=gamepad)
+
+    assert jog(False).success
+    manual = node.calibration_jog
+    # No tick or hardware command has occurred; clear the test's pending plan.
+    node.calibration_jog = None
+    node.state = 'holding'
+    result = jog(True)
+    assert result.success, result.message
+    faster = node.calibration_jog
+    assert faster['target']-faster['initial'] == node.p['gamepad_jog_step_ticks']
+    manual_rate = (manual['target']-manual['initial'])/(manual['duration']+manual['settle'])
+    gamepad_rate = (faster['target']-faster['initial'])/(faster['duration']+faster['settle'])
+    assert gamepad_rate > manual_rate*2
+    assert faster['settle'] == node.p['gamepad_settle_time_s']
+
+
+@pytest.mark.parametrize('motion', ['x', 'y', 'z', 'rotation', 'gripper'])
+def test_gamepad_speed_scale_changes_only_timing_at_current_small_steps(controller, motion):
+    node = controller
+    enable(node)
+    node.p['gamepad_cartesian_step_m'] = 0.001
+    node.p['gamepad_jog_step_ticks'] = 20
+    node.bus.read_goal_position = lambda index: node.last_written[index]
+    results = []
+    for speed in (1., 2.5):
+        node.p['gamepad_speed_scale'] = speed
+        request = SetBool.Request(data=True)
+        if motion in 'xyz':
+            response = node.cartesian_jog_request(request, None, 'xyz'.index(motion), gamepad=True)
+            assert response.success, response.message
+            plan = node.active['plan']
+            results.append((plan.duration, plan.points[-1], node.active['settle_time']))
+        else:
+            if motion == 'gripper':
+                response = node.manual_gripper_jog(request, None, gamepad=True)
+            else:
+                response = node.calibration_jog_request(request, None, 5,
+                                                        require_unconfirmed=False, gamepad=True)
+            assert response.success, response.message
+            jog = node.calibration_jog
+            results.append((jog['duration'], jog['target'], jog['settle']))
+        assert node.stop(None, None).success
+    baseline, fast = results
+    assert np.allclose(baseline[1], fast[1])  # Same direction, endpoint and step.
+    assert baseline[2] == fast[2]
+    assert baseline[0]/fast[0] == pytest.approx(2.5)
+    # Include the unchanged end-of-step wait in the perceived speed increase.
+    assert 2. <= (baseline[0]+baseline[2])/(fast[0]+fast[2]) <= 2.5
+
+
+@pytest.mark.parametrize('name,value', [
+    ('gamepad_speed_scale', 5.), ('gamepad_speed_scale', float('nan')),
+    ('gamepad_cartesian_step_m', 0.1), ('gamepad_jog_step_ticks', 81),
+    ('gamepad_settle_time_s', 0.),
+])
+def test_invalid_gamepad_speed_settings_are_rejected(controller, name, value):
+    controller.p[name] = value
+    with pytest.raises(ValueError, match='gamepad'):
+        controller._validate_settings()
 
 
 def test_tracking_fault_aborts_action_and_holds_measured_position(controller):
@@ -430,16 +604,431 @@ def test_action_cancel_holds_and_resolves_canceled_result(controller):
     future = Future()
     handle = SimpleNamespace(is_cancel_requested=True)
     node._start(Plan(node.model, current, [target]), handle=handle, future=future)
+    goal = node.last_written
+    writes = list(node.bus.writes)
     node.tick()
     assert node.state == 'stopped' and node.active is None
     assert future.result()[2] == 'canceled'
-    assert node.bus.writes[-1] == node.measured
+    assert node.last_written == goal
+    assert node.bus.writes == writes
+
+
+@pytest.mark.parametrize('motion', ['holding', 'cartesian', 'rotation', 'gripper'])
+def test_repeated_control_switch_stops_preserve_loaded_goals_and_torque(controller, motion):
+    node = controller
+    enable(node)
+    node.bus.load_error = [0, 18, 22, 0, 12, 0, 0]
+    node.bus.write_positions(node.last_written)
+    node.tick()
+    goal, feedback = node.last_written, node.measured
+    assert goal != feedback
+    node.bus.read_goal_position = lambda index: node.last_written[index]
+    node.bus.arm = MagicMock()
+    node.bus.disarm = MagicMock()
+    if motion == 'cartesian':
+        result = node.cartesian_jog_request(SetBool.Request(data=True), None, 2, gamepad=True)
+        assert result.success, result.message
+    elif motion == 'rotation':
+        assert node.calibration_jog_request(SetBool.Request(data=True), None, 5,
+                                            require_unconfirmed=False, gamepad=True).success
+    elif motion == 'gripper':
+        assert node.manual_gripper_jog(SetBool.Request(data=True), None, gamepad=True).success
+    writes = list(node.bus.writes)
+    for _ in range(5):
+        assert node.stop(None, None).success
+        node.tick()
+        assert node.last_written == goal
+        assert node.measured == feedback
+        assert node.bus.writes == writes
+        assert node.enabled and node.state == 'stopped'
+        assert node.active is None and node.calibration_jog is None
+    node.bus.arm.assert_not_called()
+    node.bus.disarm.assert_not_called()
+
+
+def calibrated_pose(node, ticks):
+    settings = load_parameters(Path(__file__).resolve().parents[1]/'config/arm6_calibration.yaml')
+    node.p.update(settings)
+    node.model = ArmModel(settings)
+    node.frame = settings['base_frame']
+    node.bus = FakeBus(ticks)
+    node.tick()
+    assert enable(node).success
+
+
+@pytest.mark.parametrize('ticks', [
+    [3449, 1227, 1416, 1117, 1298, 2525, 3548],
+    [3339, 1155, 1305, 1064, 1200, 2486, 3627],
+])
+@pytest.mark.parametrize('axis', range(3))
+@pytest.mark.parametrize('positive', [False, True])
+def test_loaded_calibrated_pose_xyz_steps_and_switches_do_not_drift(controller, ticks, axis, positive):
+    node = controller
+    calibrated_pose(node, ticks)
+    node.bus.load_error = [0, 8, 12, 0, 8, 0, 0]
+    node.bus.write_positions(node.last_written)
+    node.tick()
+    before = node.model.forward(node.model.decode(node.measured)[:6])
+    reply = node.cartesian_jog_request(SetBool.Request(data=positive), None, axis, gamepad=True)
+    assert reply.success, reply.message
+    finish(node)
+    after = node.model.forward(node.model.decode(node.measured)[:6])
+    expected = np.zeros(3)
+    expected[axis] = node.p['gamepad_cartesian_step_m']*(1 if positive else -1)
+    # Include encoder quantization, then verify stopping cannot consume the
+    # just-achieved Cartesian step by dropping the load-bearing hold offset.
+    assert np.allclose(after[:3, 3]-before[:3, 3], expected, atol=0.0005)
+    assert np.allclose(after[:3, :3], before[:3, :3], atol=0.003)
+    goal, measured = node.last_written, node.measured
+    for _ in range(3):
+        assert node.stop(None, None).success
+        node.tick()
+        assert node.last_written == goal and node.measured == measured
+
+
+def test_collapsed_pose_z_down_rejects_with_limit_details_without_changing_hold(controller):
+    node = controller
+    calibrated_pose(node, [3608, 744, 1044, 1047, 763, 2591, 4166])
+    goal, writes = node.last_written, list(node.bus.writes)
+    result = node.cartesian_jog_request(SetBool.Request(data=False), None, 2, gamepad=True)
+    assert not result.success
+    assert 'Wrist z-' in result.message
+    assert 'near joint limits' in result.message
+    assert 'J2/ID2=744' in result.message and 'J3/ID3=1044' in result.message
+    assert node.last_written == goal and node.bus.writes == writes
+    assert node.enabled and node.state == 'holding' and node.active is None
+
+
+def stream_packet(node, token, intent, deadman=True, end=False):
+    msg = Joy(axes=[float(v) for v in intent], buttons=[int(deadman), int(end)])
+    msg.header.frame_id = token
+    msg.header.stamp = node.get_clock().now().to_msg()
+    return msg
+
+
+def stream_tick(node, token, intent, **buttons):
+    node.gamepad_velocity(stream_packet(node, token, intent, **buttons))
+    if node.gamepad_stream is not None:
+        node.gamepad_stream['last_step'] = time.monotonic()-1/30
+    node.tick()
+
+
+def begin_stream(node):
+    assert enable(node).success
+    response = node.start_gamepad(None, None)
+    assert response.success, response.message
+    return response.message
+
+
+def test_continuous_stream_moves_without_active_waypoint_plans(controller):
+    node = controller
+    calibrated_pose(node, [3449, 1227, 1416, 1117, 1298, 2525, 3548])
+    token = begin_stream(node)
+    before = node.model.forward(node.model.decode(node.measured)[:6])
+    for _ in range(90):
+        stream_tick(node, token, [0, 0, 1, 0, 0])
+        assert node.state == 'moving' and node.gamepad_stream is not None
+        assert node.active is None and node.calibration_jog is None
+    node.tick()
+    after = node.model.forward(node.model.decode(node.measured)[:6])
+    assert after[2, 3]-before[2, 3] > .02
+    assert np.linalg.norm(after[:2, 3]-before[:2, 3]) < .001
+
+
+def test_stream_release_and_switch_retain_loaded_goals_without_torque_cycle(controller):
+    node = controller
+    assert enable(node).success
+    node.bus.load_error = [0, 12, 18, 0, 8, 0, 0]
+    node.bus.write_positions(node.last_written)
+    node.tick()
+    token = begin_stream(node)
+    for _ in range(10):
+        stream_tick(node, token, [0, 0, 1, 0, 0])
+    goal, writes = node.last_written, list(node.bus.writes)
+    node.bus.arm, node.bus.disarm = MagicMock(), MagicMock()
+    stream_tick(node, token, [0]*5, deadman=False)
+    assert node.last_written == goal and node.bus.writes == writes
+    assert node.enabled and node.gamepad_stream is not None
+    for _ in range(10):
+        stream_tick(node, token, [0, 0, 0, 0, 1])
+        assert node.last_written[:6] == goal[:6]
+    assert node.last_written[6] > goal[6]
+    node.bus.arm.assert_not_called()
+    node.bus.disarm.assert_not_called()
+
+
+def test_backend_watchdog_stops_when_gamepad_client_disappears(controller):
+    node = controller
+    token = begin_stream(node)
+    stream_tick(node, token, [0, 0, 0, 1, 0])
+    goal, writes = node.last_written, list(node.bus.writes)
+    node.gamepad_stream['last_input'] = time.monotonic()-1.
+    node.tick()
+    assert node.gamepad_stream is None and node.state == 'stopped'
+    assert node.enabled and node.last_written == goal and node.bus.writes == writes
+    node.gamepad_velocity(stream_packet(node, token, [0, 0, 0, 1, 0]))
+    node.tick()
+    assert node.gamepad_stream is None and node.last_written == goal
+
+
+def test_delayed_packet_does_not_refresh_watchdog(controller):
+    node = controller
+    token = begin_stream(node)
+    old_time = node.gamepad_stream['last_input']
+    msg = stream_packet(node, token, [0, 0, 1, 0, 0])
+    msg.header.stamp.sec -= 1
+    node.gamepad_velocity(msg)
+    assert node.gamepad_stream['last_input'] == old_time
+    assert np.all(node.gamepad_stream['intent'] == 0)
+
+
+def test_stream_session_cannot_replace_other_motion_or_restart_after_desktop_stop(controller):
+    node = controller
+    token = begin_stream(node)
+    assert not node.start_gamepad(None, None).success
+    assert not node.manual_gripper_jog(SetBool.Request(data=True), None).success
+    assert node.goal(request(node)) == GoalResponse.REJECT
+    assert node.stop(None, None).success
+    assert node.gamepad_stream is None
+    assert node.open_gripper(None, None).success
+    active = node.active
+    node.gamepad_velocity(stream_packet(node, token, [0, 0, 1, 0, 0]))
+    node.gamepad_velocity(stream_packet(node, token, [0]*5, end=True))
+    assert node.active is active  # Late packets cannot stop another operator.
+
+
+def test_stream_end_releases_ownership_and_invalidates_old_token(controller):
+    node = controller
+    token = begin_stream(node)
+    node.gamepad_velocity(stream_packet(node, token, [0]*5, end=True))
+    assert node.gamepad_stream is None and node.enabled
+    new_token = begin_stream(node)
+    assert new_token != token
+    node.gamepad_velocity(stream_packet(node, token, [0, 0, 1, 0, 0]))
+    assert np.all(node.gamepad_stream['intent'] == 0)
+
+
+@pytest.mark.parametrize('kind', ['nan', 'multiple', 'bad_buttons'])
+def test_malformed_current_session_packet_stops_without_losing_hold(controller, kind):
+    node = controller
+    token = begin_stream(node)
+    msg = stream_packet(node, token, [0]*5)
+    if kind == 'nan':
+        msg.axes[0] = float('nan')
+    elif kind == 'multiple':
+        msg.axes = [1., 1., 0., 0., 0.]
+    else:
+        msg.buttons = [1]
+    goal, writes = node.last_written, list(node.bus.writes)
+    node.gamepad_velocity(msg)
+    assert node.gamepad_stream is None and node.enabled
+    assert node.last_written == goal and node.bus.writes == writes
+
+
+def test_stream_reaches_j6_limit_and_reverse_works_without_new_session(controller):
+    node = controller
+    raw = list(node.bus.raw)
+    raw[5] = 4090
+    node.bus.raw = tuple(raw)
+    node.tick()
+    token = begin_stream(node)
+    for _ in range(30):
+        stream_tick(node, token, [0, 0, 0, 1, 0])
+        assert node.last_written[5] <= 4095
+    assert node.last_written[5] == 4095 and node.state == 'holding'
+    assert node.gamepad_stream['token'] == token
+    for _ in range(5):
+        stream_tick(node, token, [0, 0, 0, -1, 0])
+    assert node.last_written[5] < 4095 and node.state == 'moving'
+
+
+def test_stream_requires_confirmed_geometry(controller):
+    node = controller
+    assert enable(node).success
+    node.p['geometry_confirmed'] = False
+    assert not node.start_gamepad(None, None).success
+    assert node.gamepad_stream is None
+
+
+def test_stalled_wrist_ends_stream_before_command_exceeds_tracking_limit(controller):
+    node = controller
+    token = begin_stream(node)
+    node.bus.follow_commands = False
+    intent = [0, 0, 0, 1, 0]
+    for _ in range(100):
+        stream_tick(node, token, intent)
+        lag = np.abs(node.model.decode(node.last_written)-node.model.decode(node.measured))
+        assert np.all(lag[:6] < node.p['max_tracking_error_rad'])
+        assert lag[6] < node.p['gripper_tracking_error_m']
+        if node.gamepad_stream is None:
+            break
+    else:
+        pytest.fail('Stalled motor did not stop the stream')
+    goal, writes = node.last_written, list(node.bus.writes)
+    node.tick()
+    assert node.state == 'stopped' and node.enabled
+    assert node.last_written == goal and node.bus.writes == writes
+
+
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_slow_gripper_keeps_moving_with_bounded_goal_lead(controller, direction):
+    node = controller
+    token = begin_stream(node)
+    node.bus.follow_commands = False
+    start = node.measured
+    for _ in range(120):
+        stream_tick(node, token, [0, 0, 0, 0, direction])
+        assert node.state == 'moving' and node.gamepad_stream['token'] == token
+        gap_error = abs(node.model.decode(node.last_written)[6]-node.model.decode(node.measured)[6])
+        assert gap_error < node.p['gripper_tracking_error_m']
+        measured = node.bus.raw[6]
+        step = max(-2, min(2, node.last_written[6]-measured))
+        node.bus.raw = node.bus.raw[:6]+(measured+step,)
+    assert (node.measured[6]-start[6])*direction > 200
+    assert node.last_written[:6] == start[:6]
+
+
+def test_stalled_gripper_holds_without_ending_session_and_can_reverse(controller):
+    node = controller
+    token = begin_stream(node)
+    node.bus.follow_commands = False
+    for _ in range(100):
+        stream_tick(node, token, [0, 0, 0, 0, 1])
+        gap_error = abs(node.model.decode(node.last_written)[6]-node.model.decode(node.measured)[6])
+        assert gap_error < node.p['gripper_tracking_error_m']
+        assert node.gamepad_stream['token'] == token
+        if node.state == 'holding':
+            break
+    else:
+        pytest.fail('Stalled gripper did not enter hold')
+    assert '夹爪未跟随' in node.gamepad_stream['servo'].message
+    goal, writes = node.last_written, list(node.bus.writes)
+    for _ in range(10):
+        stream_tick(node, token, [0, 0, 0, 0, 1])
+    assert node.last_written == goal and node.bus.writes == writes
+    for _ in range(10):
+        stream_tick(node, token, [0, 0, 0, 0, -1])
+    assert node.state == 'moving' and node.last_written[6] < goal[6]
+
+
+@pytest.mark.parametrize('obstruction_tick', [3350, 3184])
+def test_closing_contact_relaxes_to_small_preload_and_latches_until_open(controller, obstruction_tick):
+    node = controller
+    node.bus.raw = node.bus.raw[:6]+(obstruction_tick,)
+    token = begin_stream(node)
+    node.bus.follow_commands = False
+    close = [0, 0, 0, 0, -1]
+    opened = [0, 0, 0, 0, 1]
+    before = node.last_written[:6]
+    lowest = obstruction_tick
+    for _ in range(60):
+        stream_tick(node, token, close)
+        lowest = min(lowest, node.last_written[6])
+        if node.gripper_contact:
+            break
+    assert node.gripper_contact and node.state == 'holding'
+    goal = node.last_written
+    assert 3180 <= goal[6] <= obstruction_tick <= goal[6]+node.p['gripper_contact_preload_ticks']
+    assert goal[6] >= lowest and goal[:6] == before
+    if obstruction_tick > 3184:
+        assert goal[6] > lowest
+    stream_tick(node, token, [0]*5, deadman=False)
+    assert node.stop(None, None).success
+    response = node.start_gamepad(None, None)
+    assert response.success
+    for _ in range(30):
+        stream_tick(node, response.message, close)
+        assert node.last_written == goal
+    stream_tick(node, response.message, opened)
+    assert not node.gripper_contact and node.last_written[6] > goal[6]
+
+
+def test_releasing_closing_stick_relaxes_goal_before_contact_timer(controller):
+    node = controller
+    token = begin_stream(node)
+    node.bus.follow_commands = False
+    start = node.measured
+    for _ in range(6):
+        stream_tick(node, token, [0, 0, 0, 0, -1])
+    goal = node.last_written
+    assert not node.gripper_contact and start[6]-goal[6] > node.p['gripper_contact_preload_ticks']
+    stream_tick(node, token, [0]*5, deadman=False)
+    after = node.last_written
+    assert after[:6] == start[:6]
+    assert after[6] == start[6]-node.p['gripper_contact_preload_ticks']
+    stream_tick(node, token, [0]*5, deadman=False)
+    assert node.last_written == after
+
+
+@pytest.mark.parametrize('axis,index', [(5, 3), (6, 4)])
+def test_wrist_controls_command_only_the_selected_motor(controller, axis, index):
+    node = controller
+    token = begin_stream(node)
+    before = node.last_written
+    intent = [0]*7
+    intent[axis] = 1
+    for _ in range(20):
+        stream_tick(node, token, intent)
+        assert node.state == 'moving'
+    assert node.last_written[index] != before[index]
+    assert all(new == old for i, (new, old) in enumerate(zip(node.last_written, before)) if i != index)
+
+
+def test_gamepad_and_controller_exchange_continuous_commands_over_ros(controller):
+    from rclpy.executors import MultiThreadedExecutor
+    from arm6_ros2.gamepad_control import GamepadControl, load_profile
+
+    node = controller
+    assert enable(node).success
+    profile = load_profile(Path(__file__).resolve().parents[3]/'docs/hardware/f710_mapping.json')
+    pad = GamepadControl(profile, context=node.context)
+    executor = MultiThreadedExecutor(context=node.context, num_threads=2)
+    executor.add_node(node)
+    executor.add_node(pad)
+    controls = Joy(axes=list(profile['baseline_axes']), buttons=[0]*profile['buttons_count'])
+
+    def pump(duration=0., until=None):
+        end = time.monotonic()+(duration if until is None else 3.)
+        while time.monotonic() < end:
+            pad.on_joy(controls)
+            executor.spin_once(timeout_sec=0.01)
+            if until is not None and until():
+                return
+        if until is not None:
+            assert until(), (pad.notice, node.state)
+
+    try:
+        pump(until=lambda: pad.state == 'holding' and pad.feedback_fresh())
+        pad.enable_input()
+        pump(until=lambda: pad.session is not None)
+        token, before = pad.session, node.last_written
+        controls.buttons[profile['mapping']['lb']['index']] = 1
+        axis = profile['mapping']['left_stick_up']
+        controls.axes[axis['index']] = axis['baseline']+axis['sign']
+        pump(.5)
+        assert node.gamepad_stream is not None and node.gamepad_stream['token'] == token
+        assert node.state == 'moving' and node.last_written != before
+        assert node.active is None and node.calibration_jog is None
+        controls.axes[axis['index']] = axis['baseline']
+        pump(until=lambda: node.state == 'holding')
+        goal, count = node.last_written, len(node.bus.writes)
+        pump(.15)
+        assert node.last_written == goal and len(node.bus.writes) == count
+        assert pad.enabled and pad.session == token
+        pad.disable()
+        pump(until=lambda: node.gamepad_stream is None and pad.session is None)
+        assert node.enabled and node.last_written == goal
+    finally:
+        executor.shutdown(timeout_sec=2.)
+        executor.remove_node(pad)
+        executor.remove_node(node)
+        pad.destroy_node()
 
 
 def test_startup_model_mismatch_closes_bus_without_enabling(monkeypatch):
     from arm6_ros2 import dynamixel_bus
     context = Context()
-    rclpy.init(context=context)
+    rclpy.init(context=context, domain_id=183)
     bus = FakeBus([2048]*7)
     bus.models = (1120,)*7
     bus.arm = MagicMock()

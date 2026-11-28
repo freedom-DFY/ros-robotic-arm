@@ -1,8 +1,11 @@
 """ROS 2 six-axis controller with an independent seventh gripper motor."""
 
+from copy import copy
+import json
 import math
 import threading
 import time
+import uuid
 
 import numpy as np
 import rclpy
@@ -15,11 +18,12 @@ from rclpy.clock import Clock, ClockType
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.task import Future
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Joy
 from std_msgs.msg import Float64, Int32MultiArray, String
 from std_srvs.srv import SetBool, Trigger
 
 from arm6_ros2.config import DEFAULTS
+from arm6_ros2.jog import ContinuousJog, INTENT_SIZE, intent_key, normalize_intent
 from arm6_ros2.model import ArmModel, JOINT_NAMES, RADIANS_PER_TICK, pose_matrix, quaternion_from_matrix, vector
 from arm6_ros2.trajectory import Plan, trajectory_request
 
@@ -32,6 +36,8 @@ class Controller(Node):
         self.closed = False
         self.active = None
         self.calibration_jog = None
+        self.gamepad_stream = None
+        self.gripper_contact = False
         self.reservation = None
         self.enabled = False
         self.state = 'read_only'
@@ -69,10 +75,27 @@ class Controller(Node):
         self.origin_pub = self.create_publisher(Int32MultiArray, '~/user_origin_ticks', 10)
         self.width_pub = self.create_publisher(Float64, '~/gripper_width', 10)
         self.status_pub = self.create_publisher(String, '~/motion_status', 10)
+        self.gamepad_feedback_pub = self.create_publisher(String, '~/gamepad/feedback', 1)
+        self.create_subscription(Joy, '~/gamepad/velocity', self.gamepad_velocity, 1)
+        self.create_service(Trigger, '~/gamepad/start', self.start_gamepad)
         self.create_subscription(JointState, '~/joint_target', self.joint_target, 1)
         self.create_subscription(PoseStamped, '~/pose_target', self.pose_target, 1)
         self.create_subscription(Float64, '~/gripper_target', self.gripper_target, 1)
         self.create_service(SetBool, '~/enable', self.enable)
+        for index, axis in enumerate('xyz'):
+            self.create_service(SetBool, f'~/manual/cartesian/{axis}/jog',
+                                lambda request, response, index=index:
+                                self.cartesian_jog_request(request, response, index))
+            self.create_service(SetBool, f'~/gamepad/cartesian/{axis}/jog',
+                                lambda request, response, index=index:
+                                self.cartesian_jog_request(request, response, index, gamepad=True))
+        self.create_service(SetBool, '~/gamepad/rotation/jog',
+                            lambda request, response:
+                            self.calibration_jog_request(request, response, 5,
+                                                         require_unconfirmed=False, gamepad=True))
+        self.create_service(SetBool, '~/gamepad/gripper/jog',
+                            lambda request, response:
+                            self.manual_gripper_jog(request, response, gamepad=True))
         for index in range(6):
             self.create_service(SetBool, f'~/calibration/joint_{index+1}/jog',
                                 lambda request, response, index=index:
@@ -125,6 +148,24 @@ class Controller(Node):
         if (type(self.p['calibration_jog_step_ticks']) is not int
                 or not 1 <= self.p['calibration_jog_step_ticks'] <= 20):
             raise ValueError('calibration_jog_step_ticks must be an integer from 1 to 20')
+        if (not math.isfinite(self.p['gamepad_speed_scale'])
+                or not 1 <= self.p['gamepad_speed_scale'] <= 4
+                or not math.isfinite(self.p['gamepad_cartesian_step_m'])
+                or not 0.001 <= self.p['gamepad_cartesian_step_m'] <= 0.01
+                or type(self.p['gamepad_jog_step_ticks']) is not int
+                or not 1 <= self.p['gamepad_jog_step_ticks'] <= 80
+                or not math.isfinite(self.p['gamepad_settle_time_s'])
+                or not 0.02 <= self.p['gamepad_settle_time_s'] <= 0.2):
+            raise ValueError('Invalid gamepad speed, step or settling settings')
+        if (not math.isfinite(self.p['gamepad_cartesian_speed_m_s'])
+                or not 0.001 <= self.p['gamepad_cartesian_speed_m_s'] <= 0.03
+                or not math.isfinite(self.p['gamepad_command_timeout_s'])
+                or not 0.1 <= self.p['gamepad_command_timeout_s'] <= 0.5):
+            raise ValueError('Invalid continuous gamepad speed or timeout')
+        if (type(self.p['gripper_goal_pwm_limit']) is not int or not 1 <= self.p['gripper_goal_pwm_limit'] <= 885
+                or type(self.p['gripper_contact_preload_ticks']) is not int
+                or not 0 <= self.p['gripper_contact_preload_ticks'] <= 12):
+            raise ValueError('Invalid gripper output limit or contact preload')
         if (np.any(home != np.round(home)) or np.any(home < self.model.tick_min)
                 or np.any(home > self.model.tick_max)):
             raise ValueError('home_ticks must be six integer positions inside joint motion limits')
@@ -150,7 +191,8 @@ class Controller(Node):
     def _ready(self, *, cartesian=False):
         if not self.enabled or self.state == 'fault':
             raise ValueError('Enable motion first; faults require disable then enable')
-        if self.active is not None or self.calibration_jog is not None or self.reservation is not None:
+        if (self.active is not None or self.calibration_jog is not None
+                or self.gamepad_stream is not None or self.reservation is not None):
             raise ValueError('Another motion is active; stop or cancel before a new command')
         current = self._feedback()
         if not self.p['calibration_confirmed']:
@@ -172,6 +214,110 @@ class Controller(Node):
             raise ValueError('Configured motion limits must lie inside servo register limits')
         self.model.encode(current)  # Motion checks apply after enable-at-current-position.
 
+    def _gamepad_feedback(self, stream, status, message):
+        self.gamepad_feedback_pub.publish(String(data=json.dumps(
+            dict(session=stream['token'], status=status, message=message), ensure_ascii=False)))
+
+    def start_gamepad(self, _request, _response):
+        with self.lock:
+            try:
+                self._ready(cartesian=True)
+                if self.state not in ('holding', 'stopped'):
+                    raise ValueError('Continuous gamepad requires a stationary arm')
+                now = time.monotonic()
+                servo = ContinuousJog(self.model, self.p, gripper_contact=self.gripper_contact)
+                self.gamepad_stream = dict(token=uuid.uuid4().hex, servo=servo,
+                                           intent=np.zeros(INTENT_SIZE), deadman=False, last_input=now, last_step=now)
+                self._gamepad_feedback(self.gamepad_stream, 'holding', '连续控制已连接；按住 LB 推杆运动')
+                return Trigger.Response(success=True, message=self.gamepad_stream['token'])
+            except ValueError as exc:
+                return Trigger.Response(success=False, message=str(exc))
+
+    def _end_gamepad(self, reason):
+        stream, self.gamepad_stream = self.gamepad_stream, None
+        if stream is not None:
+            stream['servo'].stop()
+            self._gamepad_feedback(stream, 'ended', reason)
+            if self.enabled and self.state != 'fault':
+                self.state = 'stopped'
+
+    def gamepad_velocity(self, msg):
+        with self.lock:
+            stream = self.gamepad_stream
+            if stream is None or msg.header.frame_id != stream['token']:
+                return  # Old sessions cannot restart motion after stop/reconnect.
+            stamp = msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
+            age = self.get_clock().now().nanoseconds*1e-9-stamp
+            if not -0.05 <= age <= self.p['gamepad_command_timeout_s']:
+                return  # Delayed/replayed commands do not refresh the watchdog.
+            try:
+                intent = normalize_intent(msg.axes)
+                intent_key(intent)
+                if len(msg.buttons) != 2 or any(v not in (0, 1) for v in msg.buttons):
+                    raise ValueError('Expected deadman/end-session buttons')
+            except ValueError as exc:
+                self._end_gamepad(f'手柄指令无效：{exc}；回中后重连')
+                return
+            if msg.buttons[1]:
+                self._end_gamepad('手柄会话已关闭，保持目标及扭矩')
+                return
+            stream['last_input'] = time.monotonic()
+            stream['intent'] = intent if msg.buttons[0] else np.zeros(INTENT_SIZE)
+            stream['deadman'] = bool(msg.buttons[0])
+            if intent_key(stream['intent']) is None:
+                # Capture release between control ticks, without an extra goal
+                # write or a torque cycle. Subsequent input can resume directly.
+                stream['servo'].stop()
+                stream['servo'].blocked_key = None
+                self.state = 'holding'
+
+    def _step_gamepad(self, now):
+        stream = self.gamepad_stream
+        if now-stream['last_input'] > self.p['gamepad_command_timeout_s']:
+            self._end_gamepad('手柄指令中断，已保持；回中后自动重连')
+            return
+        dt, stream['last_step'] = now-stream['last_step'], now
+        if dt <= 0 or dt > self.p['feedback_timeout_s']:
+            self._end_gamepad('连续控制周期超时，已保持；回中后重连')
+            return
+        current = self._feedback()
+        self.model.encode(current)
+        servo = stream['servo']
+        key = intent_key(stream['intent'])
+        if servo.reference is not None and key is not None:
+            lag = np.abs(current-self.model.decode(self.last_written))
+            lag[:6] = np.maximum(lag[:6], np.abs(current[:6]-servo.reference[:6]))
+            # Gripper lead is relative to the last commanded goal only. The
+            # floating-point reference may have an old axis's anchor.
+            if (np.any(lag[:6] >= self.p['max_tracking_error_rad']*0.9)
+                    or lag[6] >= self.p['gripper_tracking_error_m']*0.9):
+                self._end_gamepad('跟随误差接近限值，已保持；请回中并检查负载')
+                return
+        try:
+            goals, motor, status = servo.step(stream['intent'], current, self.last_written, dt)
+        except ValueError as exc:
+            self._end_gamepad(f'该方向不可继续：{exc}；已保持，请回中')
+            return
+        if goals is not None:
+            projected_lag = np.abs(self.model.decode(goals)-current)
+            if (np.any(projected_lag[:6] >= self.p['max_tracking_error_rad'])
+                    or projected_lag[6] >= self.p['gripper_tracking_error_m']):
+                self._end_gamepad('下一指令将超过跟随误差限值，已保持；请回中检查负载')
+                return
+            if motor is None:
+                if key[0] < 2:
+                    self.bus.write_positions(goals, indices=(0, 1, 2))
+                else:
+                    self.bus.write_positions(goals)
+                self.last_written = goals
+            else:
+                # Streaming writes are acknowledged. Measured position on the
+                # next control tick supplies the tracking check.
+                self._write_single_goal(motor, goals[motor], verify=False)
+        self.gripper_contact = servo.gripper_contact
+        self.state = 'moving' if status == 'moving' else 'holding'
+        self._gamepad_feedback(stream, status, servo.message)
+
     def _home_plan(self, raw):
         if not self.p['home_confirmed']:
             raise ValueError('Confirm the taught home pose before automatic homing')
@@ -185,7 +331,7 @@ class Controller(Node):
             try:
                 if (not self.enabled or self.state not in ('holding', 'stopped')
                         or self.active is not None or self.calibration_jog is not None
-                        or self.reservation is not None):
+                        or self.gamepad_stream is not None or self.reservation is not None):
                     raise ValueError('Set user origin only while enabled and stationary')
                 self._check_motion_bounds(self._feedback())
                 self.user_origin_ticks = tuple(self.measured[:6])
@@ -199,7 +345,7 @@ class Controller(Node):
             try:
                 if (not self.enabled or self.state not in ('holding', 'stopped')
                         or self.active is not None or self.calibration_jog is not None
-                        or self.reservation is not None):
+                        or self.gamepad_stream is not None or self.reservation is not None):
                     raise ValueError('Return home requires an enabled stationary arm')
                 current = self._feedback()
                 self._check_motion_bounds(current)
@@ -216,7 +362,7 @@ class Controller(Node):
                 self._fault(exc)
                 return Trigger.Response(success=False, message=str(exc))
 
-    def calibration_jog_request(self, request, _response, index, require_unconfirmed=True):
+    def calibration_jog_request(self, request, _response, index, require_unconfirmed=True, gamepad=False):
         with self.lock:
             proposed = None
             try:
@@ -224,7 +370,7 @@ class Controller(Node):
                     raise ValueError('Calibration jog is only available while encoder calibration is unconfirmed')
                 if (not self.enabled or self.state not in ('holding', 'stopped')
                         or self.active is not None or self.calibration_jog is not None
-                        or self.reservation is not None):
+                        or self.gamepad_stream is not None or self.reservation is not None):
                     raise ValueError('Jog requires an enabled, stationary arm without another motion')
                 self._check_motion_bounds(self._feedback())
                 proposed = {'axis': index}
@@ -232,14 +378,20 @@ class Controller(Node):
                 # Increment the existing hold goal, so repeated small jogs do not
                 # lose every step to an unmodified P-only controller's load error.
                 initial = self.bus.read_goal_position(index)
-                step = self.p['calibration_jog_step_ticks'] * (1 if request.data else -1)
+                step = self.p['gamepad_jog_step_ticks' if gamepad else 'calibration_jog_step_ticks']
+                step *= 1 if request.data else -1
                 target = initial+step
                 if not (self.model.tick_min[index] <= initial <= self.model.tick_max[index]
                         and self.model.tick_min[index] <= target <= self.model.tick_max[index]):
                     raise ValueError('Selected jog would cross the measured motor limits')
-                velocity = min(0.02, self.model.velocity[index])
-                acceleration = min(0.04, self.model.acceleration[index])
-                self._start_manual_axis(index, initial, target, velocity, acceleration)
+                velocity = self.model.velocity[index] if gamepad else min(0.02, self.model.velocity[index])
+                acceleration = (self.model.acceleration[index] if gamepad
+                                else min(0.04, self.model.acceleration[index]))
+                if gamepad:
+                    velocity *= self.p['gamepad_speed_scale']
+                    acceleration *= self.p['gamepad_speed_scale']**2
+                self._start_manual_axis(index, initial, target, velocity, acceleration,
+                                        settle=self.p['gamepad_settle_time_s'] if gamepad else 0.3)
                 return SetBool.Response(success=True, message=(
                     f'ID{self.model.ids[index]} goal {initial}->{target}; other hold goals unchanged'))
             except ValueError as exc:
@@ -250,32 +402,79 @@ class Controller(Node):
                 self._fault(exc)
                 return SetBool.Response(success=False, message=str(exc))
 
-    def _start_manual_axis(self, index, initial, target, velocity, acceleration):
+    def cartesian_jog_request(self, request, _response, index, gamepad=False):
+        """Translate frame 6 in the base frame, keeping its orientation."""
+        with self.lock:
+            try:
+                current = self._ready(cartesian=True)
+                if self.state not in ('holding', 'stopped'):
+                    raise ValueError('Cartesian jog requires a stationary arm')
+                wrist = self.model.chain(current[:6])[-1].copy()
+                step = self.p['gamepad_cartesian_step_m'] if gamepad else 0.001
+                wrist[index, 3] += step * (1 if request.data else -1)
+                # Include the configured tool transform; frame 6 remains the
+                # controlled wrist point even with a nonzero calibrated TCP.
+                points = self.model.cartesian_path(current[:6], wrist @ self.model.tcp)
+                timing_model = self.model
+                if gamepad:
+                    timing_model = copy(self.model)
+                    timing_model.velocity = self.model.velocity.copy()
+                    timing_model.acceleration = self.model.acceleration.copy()
+                    timing_model.velocity[:6] *= self.p['gamepad_speed_scale']
+                    # Time scaling by k needs velocity*k and acceleration*k².
+                    # Scaling acceleration only by k makes short jogs speed up
+                    # by sqrt(k), so they feel much slower than the selected rate.
+                    timing_model.acceleration[:6] *= self.p['gamepad_speed_scale']**2
+                plan = Plan(timing_model, current, [np.r_[q, current[6]] for q in points])
+                offset = self._arm_hold_offset(plan, self.p['max_tracking_error_rad'])
+                self._start(plan, hold_offset=offset)
+                if gamepad:
+                    self.active['settle_time'] = self.p['gamepad_settle_time_s']
+                return SetBool.Response(success=True, message=(
+                    f'Wrist {"xyz"[index]} {"+" if request.data else "-"}{step*1000:g} mm '
+                    f'in {self.frame}; orientation held'))
+            except ValueError as exc:
+                near = []
+                if self.measured is not None:
+                    for joint, (tick, low, high) in enumerate(zip(
+                            self.measured[:6], self.model.tick_min, self.model.tick_max)):
+                        if min(tick-low, high-tick) <= self.p['calibration_jog_step_ticks']:
+                            near.append(f'J{joint+1}/ID{self.model.ids[joint]}={tick} [{low:g},{high:g}]')
+                detail = f'Wrist {"xyz"[index]}{"+" if request.data else "-"}: {exc}'
+                if near:
+                    detail += '; near joint limits: '+', '.join(near)
+                self.get_logger().warning(detail)
+                return SetBool.Response(success=False, message=detail)
+            except Exception as exc:
+                self._fault(exc)
+                return SetBool.Response(success=False, message=str(exc))
+
+    def _start_manual_axis(self, index, initial, target, velocity, acceleration, *, settle=0.3):
         distance = abs(target-initial)*RADIANS_PER_TICK
         duration = max(1.875*distance/velocity,
                        math.sqrt((10/math.sqrt(3))*distance/acceleration), 0.1)*1.01
         self.calibration_jog = dict(axis=index, initial=initial, target=target, duration=duration,
-                                    started=time.monotonic(), last=initial)
+                                    started=time.monotonic(), last=initial, settle=settle)
         self.last_tick = time.monotonic()
         self.state = 'calibrating'
 
-    def _write_single_goal(self, index, tick):
-        self.bus.write_single_position(index, tick)
+    def _write_single_goal(self, index, tick, *, verify=True):
+        self.bus.write_single_position(index, tick, verify=verify)
         goals = list(self.last_written)
         goals[index] = tick
         self.last_written = tuple(goals)
 
-    def manual_gripper_jog(self, request, _response):
-        result = self.manual_gripper_request(None, None, request.data, step_only=True)
+    def manual_gripper_jog(self, request, _response, gamepad=False):
+        result = self.manual_gripper_request(None, None, request.data, step_only=True, gamepad=gamepad)
         return SetBool.Response(success=result.success, message=result.message)
 
-    def manual_gripper_request(self, _request, _response, opened, step_only=False):
+    def manual_gripper_request(self, _request, _response, opened, step_only=False, gamepad=False):
         with self.lock:
             proposed = None
             try:
                 if (not self.enabled or self.state not in ('holding', 'stopped')
                         or self.active is not None or self.calibration_jog is not None
-                        or self.reservation is not None):
+                        or self.gamepad_stream is not None or self.reservation is not None):
                     raise ValueError('Gripper control requires an enabled stationary arm')
                 self._check_motion_bounds(self._feedback())
                 proposed = {'axis': 6}
@@ -286,11 +485,22 @@ class Controller(Node):
                 if not lo <= initial <= hi:
                     raise ValueError('Gripper hold goal is outside the measured gripper range')
                 if step_only:
-                    step = self.p['calibration_jog_step_ticks']
+                    step = self.p['gamepad_jog_step_ticks' if gamepad else 'calibration_jog_step_ticks']
                     target = initial+max(-step, min(step, target-initial))
                     if target == initial:
                         raise ValueError('Gripper already at the measured endpoint')
-                self._start_manual_axis(6, initial, target, 0.05, 0.05)
+                velocity, acceleration = 0.05, 0.05
+                if gamepad:
+                    # Convert calibrated jaw-gap m/s and m/s² to motor rad/s
+                    # and rad/s²; the gripper is not an arm revolute joint.
+                    ratio = abs(self.model.opened-self.model.closed)*RADIANS_PER_TICK/self.model.width
+                    velocity = self.model.velocity[6]*ratio
+                    acceleration = self.model.acceleration[6]*ratio
+                    velocity *= self.p['gamepad_speed_scale']
+                    acceleration *= self.p['gamepad_speed_scale']**2
+                self._start_manual_axis(6, initial, target, velocity, acceleration,
+                                        settle=self.p['gamepad_settle_time_s'] if gamepad else 0.3)
+                self.gripper_contact = False
                 return Trigger.Response(success=True, message=(
                     f'Gripper goal {initial}->{target}; six arm hold goals unchanged'))
             except ValueError as exc:
@@ -318,7 +528,7 @@ class Controller(Node):
         if tick != jog['last']:
             self._write_single_goal(index, tick)
             jog['last'] = tick
-        if elapsed >= jog['duration']+0.3:
+        if elapsed >= jog['duration']+jog['settle']:
             self._write_single_goal(index, jog['target'])
             self.get_logger().info(f'Calibration jog ID{self.model.ids[index]} finished: '
                                    f'goal={jog["target"]}, feedback={measured}; record actual feedback')
@@ -395,6 +605,7 @@ class Controller(Node):
         target = current.copy()
         target[6] = width
         self._start(Plan(self.model, current, [target]))
+        self.gripper_contact = False
 
     def gripper_target(self, msg):
         self._reject_or_fault(lambda: self._gripper(msg.data))
@@ -494,7 +705,8 @@ class Controller(Node):
         if active is not None and active['future'] is not None and not active['future'].done():
             active['future'].set_result((code, message, outcome))
 
-    def _hold(self, message='Stopped', outcome='aborted'):
+    def _hold(self, message='Stopped', outcome='aborted', *, preserve_goal=True):
+        self._end_gamepad(message)
         jog, self.calibration_jog = self.calibration_jog, None
         self.reservation = None
         self._finish(-1, message, outcome)
@@ -503,9 +715,19 @@ class Controller(Node):
             if self.bus.position_limits is None or any(
                     not lo <= t <= hi for t, (lo, hi) in zip(raw, self.bus.position_limits)):
                 raise RuntimeError('Cannot confirm a hold target inside servo register limits')
-            if jog is not None:
+            if preserve_goal:
+                goal = self._valid_raw(self.last_written)
+                if any(not lo <= t <= hi for t, (lo, hi) in zip(goal, self.bus.position_limits)):
+                    raise RuntimeError('Existing hold goal is outside servo register limits')
+                # A normal stop freezes the last streamed goal. Under load,
+                # its offset from feedback supplies holding torque. Writing
+                # feedback as a new goal makes every control switch sag again.
+                # No goal rewrite and no torque-off/on cycle are needed here.
+            elif jog is not None:
                 self._write_single_goal(jog['axis'], raw[jog['axis']])
             else:
+                # A tracking fault may have a goal far from actual feedback;
+                # it must not keep driving toward that potentially unsafe goal.
                 self.bus.write_positions(raw)
                 self.last_written = raw
             self.measured = raw
@@ -517,7 +739,7 @@ class Controller(Node):
         with self.lock:
             try:
                 self._hold()
-                return Trigger.Response(success=True, message='Trajectory canceled; holding current position')
+                return Trigger.Response(success=True, message='Trajectory canceled; existing hold goals and torque retained')
             except Exception as exc:
                 self._fault(exc)
                 return Trigger.Response(success=False, message=str(exc))
@@ -527,6 +749,7 @@ class Controller(Node):
             if self.closed:
                 return SetBool.Response(success=False, message='Controller is closed')
             if not request.data:
+                self._end_gamepad('机械臂已断扭矩；恢复使能后回中重连')
                 self.calibration_jog = None
                 self.reservation = None
                 self._finish(-1, 'Disabled', 'aborted')
@@ -546,7 +769,8 @@ class Controller(Node):
                     self._home_plan(raw)
                 self.measured = self._valid_raw(self.bus.arm(
                     self.p['profile_acceleration'], self.p['profile_velocity'],
-                    command_rate_hz=self.p['rate_hz']))
+                    command_rate_hz=self.p['rate_hz'], gripper_goal_pwm_limit=self.p['gripper_goal_pwm_limit']))
+                self.gripper_contact = False
                 self.last_feedback = time.monotonic()
                 self.last_written = self.measured
                 self.enabled = True
@@ -576,7 +800,7 @@ class Controller(Node):
         self._finish(code, str(exc), 'aborted')
         try:
             # Best effort hold uses freshly read feedback, independent of motion bounds.
-            self._hold(str(exc))
+            self._hold(str(exc), preserve_goal=False)
         except Exception as hold_error:
             self.get_logger().error(f'Hold failed: {hold_error}')
             if self.bus:
@@ -609,7 +833,9 @@ class Controller(Node):
                     raise RuntimeError('Serial feedback transaction exceeded its deadline')
                 self.last_feedback = time.monotonic()
                 self.last_tick = self.last_feedback
-                if self.calibration_jog is not None:
+                if self.gamepad_stream is not None:
+                    self._step_gamepad(self.last_feedback)
+                elif self.calibration_jog is not None:
                     self._step_calibration_jog(self.last_feedback)
                 elif self.active:
                     self._step(self.last_feedback)
@@ -664,7 +890,7 @@ class Controller(Node):
                 active['stable'] = None
             elif active['stable'] is None:
                 active['stable'] = now
-            elif now-active['stable'] >= self.p['settle_time_s']:
+            elif now-active['stable'] >= active.get('settle_time', self.p['settle_time_s']):
                 self._finish()
                 self.state = 'holding'
                 return
@@ -696,6 +922,7 @@ class Controller(Node):
             if self.closed:
                 return
             self.closed = True
+            self._end_gamepad('控制器已关闭')
             self.reservation = None
             self.calibration_jog = None
             self._finish(-1, 'Controller shutting down', 'aborted')

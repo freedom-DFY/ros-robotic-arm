@@ -17,6 +17,12 @@ DEFAULTS = {
     'home_ticks': [3449, 1227, 1416, 1117, 1298, 2525],
     'home_arrival_tolerance_rad': math.radians(3.0),
     'calibration_jog_step_ticks': 20,
+    'gamepad_speed_scale': 3.0,
+    'gamepad_cartesian_speed_m_s': 0.01,
+    'gamepad_command_timeout_s': 0.25,
+    'gamepad_cartesian_step_m': 0.003,
+    'gamepad_jog_step_ticks': 60,
+    'gamepad_settle_time_s': 0.05,
     # J1..J6 then gripper; the gripper ID is confirmed by the user.
     'motor_ids': [1, 2, 3, 5, 4, 11, 12],
     'expected_model_numbers': [1120, 1120, 1120, 1000, 1000, 1000, 1000],
@@ -48,6 +54,8 @@ DEFAULTS = {
     'gripper_wraps_zero': True,
     'gripper_max_width_m': 0.06,
     'gripper_speed_m_s': 0.01,
+    'gripper_goal_pwm_limit': 132,  # About 15% duty, not a calibrated grip force.
+    'gripper_contact_preload_ticks': 5,
     'joint_velocity_limits_rad_s': [0.02, 0.02, 0.02, 0.10, 0.10, 0.10],
     'joint_acceleration_limits_rad_s2': [0.04, 0.04, 0.04, 0.20, 0.20, 0.20],
     'gripper_acceleration_m_s2': 0.02,

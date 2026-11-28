@@ -16,6 +16,12 @@
     - 2525
     home_arrival_tolerance_rad: 0.05235987755982989
     calibration_jog_step_ticks: 20
+    gamepad_speed_scale: 3.0
+    gamepad_cartesian_speed_m_s: 0.01
+    gamepad_command_timeout_s: 0.25
+    gamepad_cartesian_step_m: 0.003
+    gamepad_jog_step_ticks: 60
+    gamepad_settle_time_s: 0.05
     motor_ids:
     - 1
     - 2
@@ -101,6 +107,8 @@
     gripper_wraps_zero: true
     gripper_max_width_m: 0.06
     gripper_speed_m_s: 0.01
+    gripper_goal_pwm_limit: 132
+    gripper_contact_preload_ticks: 5
     joint_velocity_limits_rad_s:
     - 0.02
     - 0.02
