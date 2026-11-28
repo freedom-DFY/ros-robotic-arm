@@ -22,7 +22,6 @@ class DesktopControl:
         self.node, self.origin_file = node, origin_file
         self.root = tk.Tk()
         self.root.title('机械臂电脑控制 · 用户原点')
-        self.root.geometry('1080x720')
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.state = None
         self.ticks = None
@@ -71,24 +70,26 @@ class DesktopControl:
 
         grid = ttk.LabelFrame(self.root, text='六轴单独控制：每步 ±20 tick，其他关节保持目标不变')
         grid.pack(fill='x', padx=16, pady=6)
-        headers = ['关节 / 电机', '实测 tick', '用户原点 tick', '相对角度', '减少刻度', '增加刻度']
+        headers = ['关节 / 电机', '减少刻度', '增加刻度', '实测 tick', '用户原点 tick', '相对角度']
         for column, text in enumerate(headers):
-            ttk.Label(grid, text=text).grid(row=0, column=column, padx=14, pady=6)
+            ttk.Label(grid, text=text).grid(row=0, column=column, padx=8, pady=4)
+        for column in (3, 4, 5):
+            grid.columnconfigure(column, weight=1)
         self.labels, self.jog_buttons = [], []
         for index in range(6):
             values = [tk.StringVar(value='—') for _ in range(4)]
             self.labels.append(values)
-            for column, value in enumerate(values):
-                ttk.Label(grid, textvariable=value, width=16).grid(row=index+1, column=column, padx=8, pady=6)
-            for column, positive in ((4, False), (5, True)):
-                button = ttk.Button(grid, text='−20' if not positive else '+20',
+            for column, value in zip((0, 3, 4, 5), values):
+                ttk.Label(grid, textvariable=value).grid(row=index+1, column=column, padx=8, pady=4)
+            for column, positive in ((1, False), (2, True)):
+                button = ttk.Button(grid, text='−20' if not positive else '+20', width=5,
                                     command=lambda index=index, positive=positive: self.jog(index, positive))
-                button.grid(row=index+1, column=column, padx=12, pady=6)
+                button.grid(row=index+1, column=column, padx=6, pady=2)
                 self.jog_buttons.append(button)
         grip = ttk.LabelFrame(self.root, text='夹爪 ID12：只改变夹爪，六轴保持不动')
         grip.pack(fill='x', padx=16, pady=8)
         self.gripper = tk.StringVar(value='等待反馈')
-        ttk.Label(grip, textvariable=self.gripper, width=55).pack(side='left', padx=10, pady=10)
+        ttk.Label(grip, textvariable=self.gripper).pack(side='left', padx=10, pady=10)
         self.open_button = ttk.Button(grip, text='张开至已测端点', command=lambda: self.service('open'))
         self.open_button.pack(side='left', padx=8)
         self.close_button = ttk.Button(grip, text='闭合至已测端点', command=lambda: self.service('close'))
@@ -105,7 +106,7 @@ class DesktopControl:
         ttk.Button(keyboard, text='打开保留的标定工具', command=self.open_calibration).pack(side='right')
         self.origin_text = tk.StringVar(value='用户原点：等待读取')
         ttk.Label(self.root, textvariable=self.origin_text).pack(anchor='w', padx=16, pady=4)
-        self.log = tk.Text(self.root, height=8, state='disabled', wrap='word')
+        self.log = tk.Text(self.root, height=5, state='disabled', wrap='word')
         self.log.pack(fill='both', expand=True, padx=16, pady=8)
         self.root.bind('<KeyPress>', self.key)
         self.note('面板已打开。启动界面不会发送运动、使能或断扭矩命令。')

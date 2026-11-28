@@ -259,6 +259,12 @@ class Controller(Node):
         self.last_tick = time.monotonic()
         self.state = 'calibrating'
 
+    def _write_single_goal(self, index, tick):
+        self.bus.write_single_position(index, tick)
+        goals = list(self.last_written)
+        goals[index] = tick
+        self.last_written = tuple(goals)
+
     def manual_gripper_jog(self, request, _response):
         result = self.manual_gripper_request(None, None, request.data, step_only=True)
         return SetBool.Response(success=result.success, message=result.message)
@@ -310,29 +316,44 @@ class Controller(Node):
         smooth = fraction**3*(10+fraction*(-15+fraction*6))
         tick = round(jog['initial']+smooth*(jog['target']-jog['initial']))
         if tick != jog['last']:
-            self.bus.write_single_position(index, tick)
+            self._write_single_goal(index, tick)
             jog['last'] = tick
         if elapsed >= jog['duration']+0.3:
-            self.bus.write_single_position(index, jog['target'])
+            self._write_single_goal(index, jog['target'])
             self.get_logger().info(f'Calibration jog ID{self.model.ids[index]} finished: '
                                    f'goal={jog["target"]}, feedback={measured}; record actual feedback')
             self.calibration_jog = None
             self.state = 'holding'
 
-    def _start(self, plan, *, handle=None, future=None, tolerances=None):
+    def _arm_hold_offset(self, plan, path_tolerance):
+        # Carry over the stationary goal-to-measurement difference that supports
+        # the load. Keep feedback and arrival checks in the original coordinates.
+        start = self.model.encode(plan.start)
+        offset = tuple(goal-tick for goal, tick in zip(self.last_written[:6], start[:6]))
+        if np.any(np.abs(offset)*RADIANS_PER_TICK > path_tolerance):
+            raise ValueError('Existing arm hold error exceeds the trajectory tracking tolerance')
+        # Each quintic segment is monotone between its endpoints, so a fixed
+        # integer offset preserves the bounds checked at the waypoints.
+        motor_goals = np.asarray([self.model.encode(point)[:6] for point in plan.points]) + offset
+        if np.any(motor_goals < self.model.tick_min) or np.any(motor_goals > self.model.tick_max):
+            raise ValueError('Trajectory with arm hold compensation exceeds motor limits')
+        return offset + (0,)
+
+    def _start(self, plan, *, handle=None, future=None, tolerances=None, hold_offset=(0,)*7):
         # Planning can take longer than one feedback period. Never execute a
         # preflighted path from stale feedback or from a changed starting pose.
         current = self._feedback()
         if np.max(np.abs(current-plan.start)) > 0.002:
             raise ValueError('Measured start changed while planning')
+        tolerances = tolerances or {}
         self.active = {
             'plan': plan, 'started': time.monotonic(), 'stable': None,
             'handle': handle, 'future': future,
-            'path_tolerance': (tolerances or {}).get('path', np.full(6, self.p['max_tracking_error_rad'])),
-            'goal_tolerance': (tolerances or {}).get('goal', np.full(6, self.p['arrival_tolerance_rad'])),
-            'timeout': (tolerances or {}).get('timeout', self.p['arrival_timeout_s']),
+            'path_tolerance': tolerances.get('path', np.full(6, self.p['max_tracking_error_rad'])),
+            'goal_tolerance': tolerances.get('goal', np.full(6, self.p['arrival_tolerance_rad'])),
+            'timeout': tolerances.get('timeout', self.p['arrival_timeout_s']),
+            'hold_offset': hold_offset, 'last_reference': tuple(self.measured),
         }
-        self.last_written = tuple(self.measured)
         self.last_tick = time.monotonic()
         self.state = 'moving'
 
@@ -365,7 +386,8 @@ class Controller(Node):
             target = pose_matrix([pos.x, pos.y, pos.z], [quat.x, quat.y, quat.z, quat.w])
             points = self.model.cartesian_path(current[:6], target)
             # Preflight all IK and time bounds before accepting any movement.
-            self._start(Plan(self.model, current, [np.r_[q, current[6]] for q in points]))
+            plan = Plan(self.model, current, [np.r_[q, current[6]] for q in points])
+            self._start(plan, hold_offset=self._arm_hold_offset(plan, self.p['max_tracking_error_rad']))
         self._reject_or_fault(command)
 
     def _gripper(self, width):
@@ -430,7 +452,8 @@ class Controller(Node):
                 current = self._ready()
                 plan = trajectory_request(self.model, current, request.trajectory)
                 tolerance = self._action_tolerances(request)
-                self.reservation = (request, plan, tolerance)
+                offset = self._arm_hold_offset(plan, tolerance['path'])
+                self.reservation = (request, plan, tolerance, offset)
                 return GoalResponse.ACCEPT
             except ValueError as exc:
                 self.get_logger().warning(f'Rejected trajectory: {exc}')
@@ -447,13 +470,13 @@ class Controller(Node):
                 handle.abort()
                 return FollowJointTrajectory.Result(error_code=-1, error_string='Stopped before execution')
             self.reservation = None
-            _, plan, tolerance = reservation
+            _, plan, tolerance, offset = reservation
             try:
                 current = self._feedback()
                 if np.max(np.abs(current-plan.start)) > 0.002:
                     raise ValueError('Measured start changed before trajectory execution')
                 future = Future()
-                self._start(plan, handle=handle, future=future, tolerances=tolerance)
+                self._start(plan, handle=handle, future=future, tolerances=tolerance, hold_offset=offset)
             except ValueError as exc:
                 handle.abort()
                 return FollowJointTrajectory.Result(error_code=-1, error_string=str(exc))
@@ -481,12 +504,12 @@ class Controller(Node):
                     not lo <= t <= hi for t, (lo, hi) in zip(raw, self.bus.position_limits)):
                 raise RuntimeError('Cannot confirm a hold target inside servo register limits')
             if jog is not None:
-                self.bus.write_single_position(jog['axis'], raw[jog['axis']])
+                self._write_single_goal(jog['axis'], raw[jog['axis']])
             else:
                 self.bus.write_positions(raw)
+                self.last_written = raw
             self.measured = raw
             self.last_feedback = time.monotonic()
-            self.last_written = self.measured
         if self.state != 'fault':
             self.state = 'stopped' if self.enabled else 'disabled'
 
@@ -603,17 +626,20 @@ class Controller(Node):
             return
         current = self.model.decode(self.measured)
         self.model.encode(current)
-        lag = np.abs(current-self.model.decode(self.last_written))
+        lag = np.maximum(np.abs(current-self.model.decode(self.last_written)),
+                         np.abs(current-self.model.decode(active['last_reference'])))
         if (np.any(lag[:6] > active['path_tolerance'])
                 or lag[6] > self.p['gripper_tracking_error_m']):
             raise RuntimeError('Measured position exceeded trajectory tracking tolerance')
         plan = active['plan']
         elapsed = now-active['started']
         command = plan.sample(elapsed)
-        ticks = self.model.encode(command)
+        reference = self.model.encode(command)
+        ticks = tuple(tick+offset for tick, offset in zip(reference, active['hold_offset']))
         if ticks != self.last_written:
             self.bus.write_positions(ticks)
             self.last_written = ticks
+        active['last_reference'] = reference
         if active['handle'] is not None:
             feedback = FollowJointTrajectory.Feedback()
             feedback.header.stamp = self.get_clock().now().to_msg()

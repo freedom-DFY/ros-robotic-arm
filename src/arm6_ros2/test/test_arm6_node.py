@@ -117,7 +117,7 @@ def test_invalid_auto_home_is_rejected_before_torque_on(controller, case):
         raw[6] = 3152
         node.bus.raw = tuple(raw)
     else:
-        node.p['home_ticks'] = [3372, 992, 1041, 1063, 1250, 2487]
+        node.user_origin_ticks = (3372, 992, 1041, 1063, 1250, 2487)
     assert not enable(node).success
     node.bus.arm.assert_not_called()
     assert not node.enabled and node.active is None
@@ -239,6 +239,56 @@ def test_trajectory_reservation_rejects_overlapping_requests(controller):
     assert node.goal(request(node, 0)) == GoalResponse.REJECT
 
 
+def test_loaded_home_to_trajectory_retains_hold_goal_and_reaches_measured_target(controller):
+    node = controller
+    assert enable(node).success
+    node.bus.load_error[2] = 22
+    node.bus.load_error[4] = 24
+    assert node.return_home(None, None).success
+    finish(node)
+    home_goal = node.user_origin_ticks + (node.measured[6],)
+    assert node.last_written == home_goal
+    assert node.measured[2] == home_goal[2]-22
+    assert node.measured[4] == home_goal[4]-24
+
+    goal = request(node)
+    target = node.model.encode(np.r_[goal.trajectory.points[0].positions, node.model.decode(node.measured)[6]])
+    assert node.goal(goal) == GoalResponse.ACCEPT
+    handle = SimpleNamespace(request=goal, is_cancel_requested=False, publish_feedback=MagicMock(),
+                             succeed=MagicMock())
+    execution = node.execute(handle)
+    execution.send(None)
+    writes = len(node.bus.writes)
+    node._step(node.active['started'])
+    assert len(node.bus.writes) == writes  # The first reference equals the existing loaded hold.
+    finish(node)
+    with pytest.raises(StopIteration) as done:
+        execution.send(None)
+    assert done.value.value.error_code == 0
+    handle.succeed.assert_called_once()
+    assert node.measured == target
+    assert node.bus.writes[-1][2] == target[2]+22
+    assert node.bus.writes[-1][4] == target[4]+24
+
+
+def test_trajectory_rejects_hold_compensated_goal_outside_motor_limit(controller):
+    node = controller
+    raw = list(node.bus.raw)
+    raw[2] = int(node.model.tick_max[2])-10
+    node.bus.raw = tuple(raw)
+    assert enable(node).success
+    node.bus.load_error[2] = 22
+    node.bus.write_positions(node.last_written)
+    node.tick()
+    goal = request(node)
+    target = list(node.measured)
+    target[2] = int(node.model.tick_max[2])-5
+    goal.trajectory.points[0].positions = node.model.decode(target)[:6].tolist()
+    assert node.goal(goal) == GoalResponse.REJECT
+    assert node.reservation is None and node.active is None
+    assert node.bus.writes == [tuple(raw)]
+
+
 def test_stopped_action_cannot_consume_a_later_goal_reservation(controller):
     import asyncio
     node = controller
@@ -286,6 +336,7 @@ class FakeBus:
         self.writes = []
         self.models = tuple(DEFAULTS['expected_model_numbers'])
         self.follow_commands = True
+        self.load_error = [0]*7
 
     def arm(self, acceleration, velocity, *, command_rate_hz):
         return self.raw
@@ -295,7 +346,7 @@ class FakeBus:
 
     def write_positions(self, raw):
         if self.follow_commands:
-            self.raw = tuple(raw)
+            self.raw = tuple(tick-error for tick, error in zip(raw, self.load_error))
         self.writes.append(tuple(raw))
 
     def read_hardware_errors(self):
