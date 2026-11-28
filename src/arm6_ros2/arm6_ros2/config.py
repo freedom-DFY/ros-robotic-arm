@@ -20,9 +20,6 @@ DEFAULTS = {
     'gamepad_speed_scale': 3.0,
     'gamepad_cartesian_speed_m_s': 0.01,
     'gamepad_command_timeout_s': 0.25,
-    'gamepad_cartesian_step_m': 0.003,
-    'gamepad_jog_step_ticks': 60,
-    'gamepad_settle_time_s': 0.05,
     # J1..J6 then gripper; the gripper ID is confirmed by the user.
     'motor_ids': [1, 2, 3, 5, 4, 11, 12],
     'expected_model_numbers': [1120, 1120, 1120, 1000, 1000, 1000, 1000],
@@ -76,15 +73,21 @@ DEFAULTS = {
     'max_waypoints': 2000,
 }
 
+# Old trial YAMLs may still contain these settings. Continuous control never
+# used them, so ignore only these names while rejecting other unknown keys.
+RETIRED_GAMEPAD_PARAMETERS = frozenset((
+    'gamepad_cartesian_step_m', 'gamepad_jog_step_ticks', 'gamepad_settle_time_s',
+))
 
 def load_parameters(path):
-    """Load wildcard and named ROS 2 sections; reject obsolete/unknown options."""
+    """Load wildcard and named ROS 2 sections, rejecting unknown options."""
     content = yaml.safe_load(Path(path).read_text(encoding='utf-8')) or {}
     result = dict(DEFAULTS)
     found = False
     for name in ('/**', 'arm6', '/arm6'):
         if name in content:
-            result.update(content[name].get('ros__parameters', {}))
+            result.update({key: value for key, value in content[name].get('ros__parameters', {}).items()
+                           if key not in RETIRED_GAMEPAD_PARAMETERS})
             found = True
     if not found:
         raise ValueError('Expected ROS 2 YAML section /**, arm6 or /arm6')

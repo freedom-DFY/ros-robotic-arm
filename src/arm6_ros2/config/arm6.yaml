@@ -28,9 +28,6 @@
     gamepad_speed_scale: 3.0  # Gamepad velocity multiplier; manual jogs unchanged.
     gamepad_cartesian_speed_m_s: 0.01
     gamepad_command_timeout_s: 0.25
-    gamepad_cartesian_step_m: 0.003
-    gamepad_jog_step_ticks: 60
-    gamepad_settle_time_s: 0.05
     motor_ids:
     - 1
     - 2

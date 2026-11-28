@@ -1,6 +1,5 @@
 """ROS 2 six-axis controller with an independent seventh gripper motor."""
 
-from copy import copy
 import json
 import math
 import threading
@@ -86,16 +85,6 @@ class Controller(Node):
             self.create_service(SetBool, f'~/manual/cartesian/{axis}/jog',
                                 lambda request, response, index=index:
                                 self.cartesian_jog_request(request, response, index))
-            self.create_service(SetBool, f'~/gamepad/cartesian/{axis}/jog',
-                                lambda request, response, index=index:
-                                self.cartesian_jog_request(request, response, index, gamepad=True))
-        self.create_service(SetBool, '~/gamepad/rotation/jog',
-                            lambda request, response:
-                            self.calibration_jog_request(request, response, 5,
-                                                         require_unconfirmed=False, gamepad=True))
-        self.create_service(SetBool, '~/gamepad/gripper/jog',
-                            lambda request, response:
-                            self.manual_gripper_jog(request, response, gamepad=True))
         for index in range(6):
             self.create_service(SetBool, f'~/calibration/joint_{index+1}/jog',
                                 lambda request, response, index=index:
@@ -150,14 +139,7 @@ class Controller(Node):
             raise ValueError('calibration_jog_step_ticks must be an integer from 1 to 20')
         if (not math.isfinite(self.p['gamepad_speed_scale'])
                 or not 1 <= self.p['gamepad_speed_scale'] <= 4
-                or not math.isfinite(self.p['gamepad_cartesian_step_m'])
-                or not 0.001 <= self.p['gamepad_cartesian_step_m'] <= 0.01
-                or type(self.p['gamepad_jog_step_ticks']) is not int
-                or not 1 <= self.p['gamepad_jog_step_ticks'] <= 80
-                or not math.isfinite(self.p['gamepad_settle_time_s'])
-                or not 0.02 <= self.p['gamepad_settle_time_s'] <= 0.2):
-            raise ValueError('Invalid gamepad speed, step or settling settings')
-        if (not math.isfinite(self.p['gamepad_cartesian_speed_m_s'])
+                or not math.isfinite(self.p['gamepad_cartesian_speed_m_s'])
                 or not 0.001 <= self.p['gamepad_cartesian_speed_m_s'] <= 0.03
                 or not math.isfinite(self.p['gamepad_command_timeout_s'])
                 or not 0.1 <= self.p['gamepad_command_timeout_s'] <= 0.5):
@@ -227,7 +209,7 @@ class Controller(Node):
                 now = time.monotonic()
                 servo = ContinuousJog(self.model, self.p, gripper_contact=self.gripper_contact)
                 self.gamepad_stream = dict(token=uuid.uuid4().hex, servo=servo,
-                                           intent=np.zeros(INTENT_SIZE), deadman=False, last_input=now, last_step=now)
+                                           intent=np.zeros(INTENT_SIZE), last_input=now, last_step=now)
                 self._gamepad_feedback(self.gamepad_stream, 'holding', '连续控制已连接；按住 LB 推杆运动')
                 return Trigger.Response(success=True, message=self.gamepad_stream['token'])
             except ValueError as exc:
@@ -263,7 +245,6 @@ class Controller(Node):
                 return
             stream['last_input'] = time.monotonic()
             stream['intent'] = intent if msg.buttons[0] else np.zeros(INTENT_SIZE)
-            stream['deadman'] = bool(msg.buttons[0])
             if intent_key(stream['intent']) is None:
                 # Capture release between control ticks, without an extra goal
                 # write or a torque cycle. Subsequent input can resume directly.
@@ -362,7 +343,7 @@ class Controller(Node):
                 self._fault(exc)
                 return Trigger.Response(success=False, message=str(exc))
 
-    def calibration_jog_request(self, request, _response, index, require_unconfirmed=True, gamepad=False):
+    def calibration_jog_request(self, request, _response, index, require_unconfirmed=True):
         with self.lock:
             proposed = None
             try:
@@ -378,20 +359,15 @@ class Controller(Node):
                 # Increment the existing hold goal, so repeated small jogs do not
                 # lose every step to an unmodified P-only controller's load error.
                 initial = self.bus.read_goal_position(index)
-                step = self.p['gamepad_jog_step_ticks' if gamepad else 'calibration_jog_step_ticks']
+                step = self.p['calibration_jog_step_ticks']
                 step *= 1 if request.data else -1
                 target = initial+step
                 if not (self.model.tick_min[index] <= initial <= self.model.tick_max[index]
                         and self.model.tick_min[index] <= target <= self.model.tick_max[index]):
                     raise ValueError('Selected jog would cross the measured motor limits')
-                velocity = self.model.velocity[index] if gamepad else min(0.02, self.model.velocity[index])
-                acceleration = (self.model.acceleration[index] if gamepad
-                                else min(0.04, self.model.acceleration[index]))
-                if gamepad:
-                    velocity *= self.p['gamepad_speed_scale']
-                    acceleration *= self.p['gamepad_speed_scale']**2
-                self._start_manual_axis(index, initial, target, velocity, acceleration,
-                                        settle=self.p['gamepad_settle_time_s'] if gamepad else 0.3)
+                velocity = min(0.02, self.model.velocity[index])
+                acceleration = min(0.04, self.model.acceleration[index])
+                self._start_manual_axis(index, initial, target, velocity, acceleration)
                 return SetBool.Response(success=True, message=(
                     f'ID{self.model.ids[index]} goal {initial}->{target}; other hold goals unchanged'))
             except ValueError as exc:
@@ -402,7 +378,7 @@ class Controller(Node):
                 self._fault(exc)
                 return SetBool.Response(success=False, message=str(exc))
 
-    def cartesian_jog_request(self, request, _response, index, gamepad=False):
+    def cartesian_jog_request(self, request, _response, index):
         """Translate frame 6 in the base frame, keeping its orientation."""
         with self.lock:
             try:
@@ -410,26 +386,14 @@ class Controller(Node):
                 if self.state not in ('holding', 'stopped'):
                     raise ValueError('Cartesian jog requires a stationary arm')
                 wrist = self.model.chain(current[:6])[-1].copy()
-                step = self.p['gamepad_cartesian_step_m'] if gamepad else 0.001
+                step = 0.001
                 wrist[index, 3] += step * (1 if request.data else -1)
                 # Include the configured tool transform; frame 6 remains the
                 # controlled wrist point even with a nonzero calibrated TCP.
                 points = self.model.cartesian_path(current[:6], wrist @ self.model.tcp)
-                timing_model = self.model
-                if gamepad:
-                    timing_model = copy(self.model)
-                    timing_model.velocity = self.model.velocity.copy()
-                    timing_model.acceleration = self.model.acceleration.copy()
-                    timing_model.velocity[:6] *= self.p['gamepad_speed_scale']
-                    # Time scaling by k needs velocity*k and acceleration*k².
-                    # Scaling acceleration only by k makes short jogs speed up
-                    # by sqrt(k), so they feel much slower than the selected rate.
-                    timing_model.acceleration[:6] *= self.p['gamepad_speed_scale']**2
-                plan = Plan(timing_model, current, [np.r_[q, current[6]] for q in points])
+                plan = Plan(self.model, current, [np.r_[q, current[6]] for q in points])
                 offset = self._arm_hold_offset(plan, self.p['max_tracking_error_rad'])
                 self._start(plan, hold_offset=offset)
-                if gamepad:
-                    self.active['settle_time'] = self.p['gamepad_settle_time_s']
                 return SetBool.Response(success=True, message=(
                     f'Wrist {"xyz"[index]} {"+" if request.data else "-"}{step*1000:g} mm '
                     f'in {self.frame}; orientation held'))
@@ -449,12 +413,12 @@ class Controller(Node):
                 self._fault(exc)
                 return SetBool.Response(success=False, message=str(exc))
 
-    def _start_manual_axis(self, index, initial, target, velocity, acceleration, *, settle=0.3):
+    def _start_manual_axis(self, index, initial, target, velocity, acceleration):
         distance = abs(target-initial)*RADIANS_PER_TICK
         duration = max(1.875*distance/velocity,
                        math.sqrt((10/math.sqrt(3))*distance/acceleration), 0.1)*1.01
         self.calibration_jog = dict(axis=index, initial=initial, target=target, duration=duration,
-                                    started=time.monotonic(), last=initial, settle=settle)
+                                    started=time.monotonic(), last=initial)
         self.last_tick = time.monotonic()
         self.state = 'calibrating'
 
@@ -464,11 +428,11 @@ class Controller(Node):
         goals[index] = tick
         self.last_written = tuple(goals)
 
-    def manual_gripper_jog(self, request, _response, gamepad=False):
-        result = self.manual_gripper_request(None, None, request.data, step_only=True, gamepad=gamepad)
+    def manual_gripper_jog(self, request, _response):
+        result = self.manual_gripper_request(None, None, request.data, step_only=True)
         return SetBool.Response(success=result.success, message=result.message)
 
-    def manual_gripper_request(self, _request, _response, opened, step_only=False, gamepad=False):
+    def manual_gripper_request(self, _request, _response, opened, step_only=False):
         with self.lock:
             proposed = None
             try:
@@ -485,21 +449,11 @@ class Controller(Node):
                 if not lo <= initial <= hi:
                     raise ValueError('Gripper hold goal is outside the measured gripper range')
                 if step_only:
-                    step = self.p['gamepad_jog_step_ticks' if gamepad else 'calibration_jog_step_ticks']
+                    step = self.p['calibration_jog_step_ticks']
                     target = initial+max(-step, min(step, target-initial))
                     if target == initial:
                         raise ValueError('Gripper already at the measured endpoint')
-                velocity, acceleration = 0.05, 0.05
-                if gamepad:
-                    # Convert calibrated jaw-gap m/s and m/s² to motor rad/s
-                    # and rad/s²; the gripper is not an arm revolute joint.
-                    ratio = abs(self.model.opened-self.model.closed)*RADIANS_PER_TICK/self.model.width
-                    velocity = self.model.velocity[6]*ratio
-                    acceleration = self.model.acceleration[6]*ratio
-                    velocity *= self.p['gamepad_speed_scale']
-                    acceleration *= self.p['gamepad_speed_scale']**2
-                self._start_manual_axis(6, initial, target, velocity, acceleration,
-                                        settle=self.p['gamepad_settle_time_s'] if gamepad else 0.3)
+                self._start_manual_axis(6, initial, target, 0.05, 0.05)
                 self.gripper_contact = False
                 return Trigger.Response(success=True, message=(
                     f'Gripper goal {initial}->{target}; six arm hold goals unchanged'))
@@ -528,7 +482,7 @@ class Controller(Node):
         if tick != jog['last']:
             self._write_single_goal(index, tick)
             jog['last'] = tick
-        if elapsed >= jog['duration']+jog['settle']:
+        if elapsed >= jog['duration']+0.3:
             self._write_single_goal(index, jog['target'])
             self.get_logger().info(f'Calibration jog ID{self.model.ids[index]} finished: '
                                    f'goal={jog["target"]}, feedback={measured}; record actual feedback')
@@ -890,7 +844,7 @@ class Controller(Node):
                 active['stable'] = None
             elif active['stable'] is None:
                 active['stable'] = now
-            elif now-active['stable'] >= active.get('settle_time', self.p['settle_time_s']):
+            elif now-active['stable'] >= self.p['settle_time_s']:
                 self._finish()
                 self.state = 'holding'
                 return

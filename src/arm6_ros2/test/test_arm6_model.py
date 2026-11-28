@@ -84,11 +84,13 @@ def test_yaml_matches_defaults():
 def test_configuration_sections_and_obsolete_options(tmp_path):
     path = tmp_path/'arm6.yaml'
     path.write_text(yaml.safe_dump({
-        '/**': {'ros__parameters': {'baud_rate': 57600}},
+        '/**': {'ros__parameters': {'baud_rate': 57600, 'gamepad_cartesian_step_m': 0.001,
+                                    'gamepad_jog_step_ticks': 20, 'gamepad_settle_time_s': 0.05}},
         'arm6': {'ros__parameters': {'baud_rate': 1000000}},
         '/arm6': {'ros__parameters': {'device': '/test/only'}},
     }))
     parameters = load_parameters(path)
+    assert parameters.keys() == DEFAULTS.keys()
     assert parameters['baud_rate'] == 1000000
     assert parameters['device'] == '/test/only'
     path.write_text('/**:\n  ros__parameters:\n    dry_run: true\n')

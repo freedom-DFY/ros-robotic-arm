@@ -120,16 +120,14 @@ XY 平移保持高度并冻结 J4–J6，前三关节转动时末端朝向可能
 | `gamepad_speed_scale` | 3.0 | 手柄速度倍率，范围 1–4；关节速度乘倍率、加速度乘倍率平方，普通轨迹限制不变 |
 | `gamepad_cartesian_speed_m_s` | 0.01 | 倍率为 1 时的最大笛卡尔速度，范围 0.001–0.03 m/s |
 | `gamepad_command_timeout_s` | 0.25 | 控制器独立的速度包超时，范围 0.1–0.5 s |
-| `gamepad_cartesian_step_m` | 0.003 | 仅旧式点动服务使用；连续手柄控制不按此步长起停 |
-| `gamepad_jog_step_ticks` | 60 | 仅旧式点动服务的刻度上限 |
-| `gamepad_settle_time_s` | 0.05 | 仅旧式点动服务的到位等待；连续控制无逐步等待 |
 
 连续控制接口：`/arm6/gamepad/start`（`Trigger`）返回会话标识；
 `/arm6/gamepad/velocity`（`Joy`）的 axes 为归一化 `[X,Y,Z,J6,开口,J4,J5]`，buttons 为 `[允许运动,结束会话]`。
 原有的五轴消息仍可控制前三个平移方向、J6 和夹爪。
 消息带当前时间戳，`header.frame_id` 为会话标识。`/arm6/gamepad/feedback`（`String`）返回 JSON 状态。
 过期包、旧会话包不会刷新看门狗，也不能在停止后重新启动或影响别人的运动。
-原有 `/manual/` 和 `/gamepad/.../jog` 点动服务保留，手柄窗口改用上述连续接口。
+手柄窗口使用上述连续接口。桌面与标定使用 `/manual/` 和 `/calibration/` 入口。
+旧调试 YAML 中的 `gamepad_cartesian_step_m`、`gamepad_jog_step_ticks` 和 `gamepad_settle_time_s` 会被忽略。
 
 本次用户已确认的实际映射为：左摇杆上/右 axes 7/6，右摇杆上/右 axes 4/3，
 十字键上/下 axis 1 的正/负方向；LB/A/B 为 buttons 4/0/1。

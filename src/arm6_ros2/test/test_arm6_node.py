@@ -459,95 +459,9 @@ def test_cartesian_jog_stop_freezes_existing_goal(controller):
     assert node.bus.writes == writes
 
 
-@pytest.mark.parametrize('axis', range(3))
-@pytest.mark.parametrize('positive', [False, True])
-def test_gamepad_cartesian_jog_is_faster_without_changing_other_trajectory_limits(controller, axis, positive):
-    node = controller
-    enable(node)
-    original_velocity = node.model.velocity.copy()
-    original_acceleration = node.model.acceleration.copy()
-    before = node.model.chain(node.model.decode(node.measured)[:6])[-1]
-    response = node.cartesian_jog_request(SetBool.Request(data=positive), None, axis, gamepad=True)
-    assert response.success, response.message
-    plan = node.active['plan']
-    after = node.model.chain(plan.points[-1][:6])[-1]
-    delta = np.zeros(3)
-    delta[axis] = node.p['gamepad_cartesian_step_m']*(1 if positive else -1)
-    assert np.allclose(after[:3, 3]-before[:3, 3], delta, atol=1e-5)
-    assert np.allclose(after[:3, :3], before[:3, :3], atol=1e-4)
-    ordinary = Plan(node.model, plan.start, plan.points[1:])
-    assert plan.duration < ordinary.duration*0.7
-    assert np.array_equal(node.model.velocity, original_velocity)
-    assert np.array_equal(node.model.acceleration, original_acceleration)
-    assert node.active['settle_time'] == node.p['gamepad_settle_time_s']
-    finish(node)
-
-
-@pytest.mark.parametrize('axis', [5, 6])
-def test_gamepad_rotation_and_gripper_have_higher_throughput_than_manual_jogs(controller, axis):
-    node = controller
-    enable(node)
-    node.bus.read_goal_position = lambda index: node.last_written[index]
-    request = SetBool.Request(data=True)
-
-    def jog(gamepad):
-        if axis == 6:
-            return node.manual_gripper_jog(request, None, gamepad=gamepad)
-        return node.calibration_jog_request(request, None, 5, require_unconfirmed=False, gamepad=gamepad)
-
-    assert jog(False).success
-    manual = node.calibration_jog
-    # No tick or hardware command has occurred; clear the test's pending plan.
-    node.calibration_jog = None
-    node.state = 'holding'
-    result = jog(True)
-    assert result.success, result.message
-    faster = node.calibration_jog
-    assert faster['target']-faster['initial'] == node.p['gamepad_jog_step_ticks']
-    manual_rate = (manual['target']-manual['initial'])/(manual['duration']+manual['settle'])
-    gamepad_rate = (faster['target']-faster['initial'])/(faster['duration']+faster['settle'])
-    assert gamepad_rate > manual_rate*2
-    assert faster['settle'] == node.p['gamepad_settle_time_s']
-
-
-@pytest.mark.parametrize('motion', ['x', 'y', 'z', 'rotation', 'gripper'])
-def test_gamepad_speed_scale_changes_only_timing_at_current_small_steps(controller, motion):
-    node = controller
-    enable(node)
-    node.p['gamepad_cartesian_step_m'] = 0.001
-    node.p['gamepad_jog_step_ticks'] = 20
-    node.bus.read_goal_position = lambda index: node.last_written[index]
-    results = []
-    for speed in (1., 2.5):
-        node.p['gamepad_speed_scale'] = speed
-        request = SetBool.Request(data=True)
-        if motion in 'xyz':
-            response = node.cartesian_jog_request(request, None, 'xyz'.index(motion), gamepad=True)
-            assert response.success, response.message
-            plan = node.active['plan']
-            results.append((plan.duration, plan.points[-1], node.active['settle_time']))
-        else:
-            if motion == 'gripper':
-                response = node.manual_gripper_jog(request, None, gamepad=True)
-            else:
-                response = node.calibration_jog_request(request, None, 5,
-                                                        require_unconfirmed=False, gamepad=True)
-            assert response.success, response.message
-            jog = node.calibration_jog
-            results.append((jog['duration'], jog['target'], jog['settle']))
-        assert node.stop(None, None).success
-    baseline, fast = results
-    assert np.allclose(baseline[1], fast[1])  # Same direction, endpoint and step.
-    assert baseline[2] == fast[2]
-    assert baseline[0]/fast[0] == pytest.approx(2.5)
-    # Include the unchanged end-of-step wait in the perceived speed increase.
-    assert 2. <= (baseline[0]+baseline[2])/(fast[0]+fast[2]) <= 2.5
-
-
 @pytest.mark.parametrize('name,value', [
     ('gamepad_speed_scale', 5.), ('gamepad_speed_scale', float('nan')),
-    ('gamepad_cartesian_step_m', 0.1), ('gamepad_jog_step_ticks', 81),
-    ('gamepad_settle_time_s', 0.),
+    ('gamepad_cartesian_speed_m_s', 0.1), ('gamepad_command_timeout_s', 0.),
 ])
 def test_invalid_gamepad_speed_settings_are_rejected(controller, name, value):
     controller.p[name] = value
@@ -626,13 +540,13 @@ def test_repeated_control_switch_stops_preserve_loaded_goals_and_torque(controll
     node.bus.arm = MagicMock()
     node.bus.disarm = MagicMock()
     if motion == 'cartesian':
-        result = node.cartesian_jog_request(SetBool.Request(data=True), None, 2, gamepad=True)
+        result = node.cartesian_jog_request(SetBool.Request(data=True), None, 2)
         assert result.success, result.message
     elif motion == 'rotation':
         assert node.calibration_jog_request(SetBool.Request(data=True), None, 5,
-                                            require_unconfirmed=False, gamepad=True).success
+                                            require_unconfirmed=False).success
     elif motion == 'gripper':
-        assert node.manual_gripper_jog(SetBool.Request(data=True), None, gamepad=True).success
+        assert node.manual_gripper_jog(SetBool.Request(data=True), None).success
     writes = list(node.bus.writes)
     for _ in range(5):
         assert node.stop(None, None).success
@@ -662,19 +576,19 @@ def calibrated_pose(node, ticks):
 ])
 @pytest.mark.parametrize('axis', range(3))
 @pytest.mark.parametrize('positive', [False, True])
-def test_loaded_calibrated_pose_xyz_steps_and_switches_do_not_drift(controller, ticks, axis, positive):
+def test_loaded_calibrated_pose_manual_xyz_steps_and_switches_do_not_drift(controller, ticks, axis, positive):
     node = controller
     calibrated_pose(node, ticks)
     node.bus.load_error = [0, 8, 12, 0, 8, 0, 0]
     node.bus.write_positions(node.last_written)
     node.tick()
     before = node.model.forward(node.model.decode(node.measured)[:6])
-    reply = node.cartesian_jog_request(SetBool.Request(data=positive), None, axis, gamepad=True)
+    reply = node.cartesian_jog_request(SetBool.Request(data=positive), None, axis)
     assert reply.success, reply.message
     finish(node)
     after = node.model.forward(node.model.decode(node.measured)[:6])
     expected = np.zeros(3)
-    expected[axis] = node.p['gamepad_cartesian_step_m']*(1 if positive else -1)
+    expected[axis] = 0.001*(1 if positive else -1)
     # Include encoder quantization, then verify stopping cannot consume the
     # just-achieved Cartesian step by dropping the load-bearing hold offset.
     assert np.allclose(after[:3, 3]-before[:3, 3], expected, atol=0.0005)
@@ -690,7 +604,7 @@ def test_collapsed_pose_z_down_rejects_with_limit_details_without_changing_hold(
     node = controller
     calibrated_pose(node, [3608, 744, 1044, 1047, 763, 2591, 4166])
     goal, writes = node.last_written, list(node.bus.writes)
-    result = node.cartesian_jog_request(SetBool.Request(data=False), None, 2, gamepad=True)
+    result = node.cartesian_jog_request(SetBool.Request(data=False), None, 2)
     assert not result.success
     assert 'Wrist z-' in result.message
     assert 'near joint limits' in result.message
