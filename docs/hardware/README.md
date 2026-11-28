@@ -14,8 +14,8 @@
 | 运行上限 tick | 4095 | 2700 | 3347 |
 | 速度上限 rad/s | 0.02 | 0.02 | 0.02 |
 
-运行几何采用完整 CAD 模型，见 [改进 DH 参数表](../../src/arm6_ros2/README.md#1-电机与几何配置)。
-基座为总装 CAD 坐标系，保存姿态为关节零位，关节正方向按舵机局部 +Z 右手定则。
+默认配置使用完整 CAD 模型，见 [改进 DH 参数表](../../src/arm6_ros2/README.md#1-电机与几何配置)。
+该配置的基座为总装 CAD 坐标系，保存姿态为关节零位，关节正方向按舵机局部 +Z 右手定则。
 上表编码器零位与方向仍为旧记录，不能视为已与该 CAD 姿态对齐。
 编码映射为 `q=direction*(tick-zero)*2π/4096`。
 
@@ -26,7 +26,7 @@ ID3 原记录为 1047–3347；2026-11-27 按用户要求用保持姿态重新�
 57 个反馈样本为 1043–1044 tick，取最小值 1043，现用 1043–3347。
 编码增大与运动学角度增大的方向不必相同，不因“上抬”描述修改符号。
 
-对应当前配置为 `src/arm6_ros2/config/arm6.yaml`；CAD 零姿态末端位置与球腕几何由
+对应默认配置为 `src/arm6_ros2/config/arm6.yaml`；CAD 零姿态末端位置与球腕几何由
 `test/test_arm6_model.py` 检查。历史三轴轨迹文件已删除，旧标定数值及依据保留在此。
 
 ## 暂定新增硬件
@@ -73,6 +73,47 @@ CAD 腕部三轴交于同一腕心，保存姿态 J4/J6 共线；J3 的轴间距
 最新保存的用户原点为 `[3449,1227,1416,1117,1298,2525]` tick，
 对应 ID `[1,2,3,5,4,11]`，见 [用户原点记录](user_origin.json)。
 电脑手动控制直接基于该编码参考，CAD 图及模型编码零位不再作为点动或回用户原点的前置条件。
+
+## 实机标定配置
+
+2026-11-28 的实机试验采用 [arm6_calibration.yaml](../../src/arm6_ros2/config/arm6_calibration.yaml)。
+这是运行中控制器加载的临时参数文件的原样归档。它使用 `arm6_calibrated` 基座、实物参考姿态 A0 和实测关节方向。
+DH 的 `a`、`d`、`alpha` 来自 CAD，参考角由实物姿态确定。示教回位沿用 `user_origin.json` 的六轴刻度。
+模型输出的末端点为夹爪转接件中心，实机配置使能后原地保持。
+
+[实机标定记录](arm6_calibration_2026-11-28.json) 保存 A0、腕部验证姿态、六轴参数与 30 mm 复测的起止读数。
+复测通过逆解预检，执行结束时报到位超时。结束后的偏差用于后续排查。
+
+## 离线复现直线逆解失败
+
+用[折叠姿态原始读数](encoder_calibration_pending.json)和默认 `arm6.yaml`，沿旧模型的水平径向向外规划 100 mm，
+保持末端朝向和开口。旧编码映射将该姿态算得接近伸展上限，逐毫米逆解在第 **3.0 mm** 无法继续。
+这是旧映射的离线复现，与实机标定配置下的 30 mm 终点到位超时属于不同测试现象。
+
+在仓库根目录运行以下代码，只加载模型并调用规划函数。
+
+```bash
+source /opt/ros/jazzy/setup.bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src/arm6_ros2${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
+import json
+from pathlib import Path
+
+from arm6_ros2.config import load_parameters
+from arm6_ros2.forward_line_test import forward_plan
+from arm6_ros2.model import ArmModel
+
+record = json.loads(Path('docs/hardware/encoder_calibration_pending.json').read_text())
+model = ArmModel(load_parameters('src/arm6_ros2/config/arm6.yaml'))
+try:
+    forward_plan(model, model.decode(record['measured_ticks']), 'radial', 0.005)
+except ValueError as error:
+    print(error)
+    if 'unreachable at 3.0 mm of 100 mm' not in str(error):
+        raise
+else:
+    raise SystemExit('Expected the reference path to fail at 3.0 mm')
+PY
+```
 
 ## 原始资料
 

@@ -255,15 +255,18 @@ ID11 不跨零点；夹爪保持使能时实测开口。服务成功表示开始
 
 ## 3. 正式参数
 
-配置文件为 [config/arm6.yaml](config/arm6.yaml)，也可指定外部配置：
+默认配置为 [config/arm6.yaml](config/arm6.yaml)。
+[config/arm6_calibration.yaml](config/arm6_calibration.yaml) 保存实机试验所用参数，基座为 `arm6_calibrated`，
+使能时保持实测位置。需要加载该配置时，从工作空间根目录运行：
 
 ```bash
 ros2 launch arm6_ros2 arm6.launch.py \
-  config:=/absolute/path/your_measured_arm6.yaml \
+  config:="$PWD/src/arm6_ros2/config/arm6_calibration.yaml" \
   device:=/dev/ttyUSB0 baud_rate:=1000000
 ```
 
 `device`、`baud_rate` 以 launch 参数为准；其余参数在启动时从 YAML 读取，运行中只读。
+`config:=` 也可指定其他配置的绝对路径。两份配置的区别和实测依据见[硬件标定记录](../../docs/hardware/README.md#实机标定配置)。
 不通过 launch、直接执行 `ros2 run arm6_ros2 arm6_node --ros-args --params-file ...` 时，
 串口设置采用参数文件中的值。
 
@@ -381,7 +384,7 @@ ros2 run arm6_ros2 forward_line_test
 也可用 `--bearing-deg` 指定相对水平向外方向的转角：正值向左，负值向右。
 默认 TCP 峰值速度上限 0.005 m/s，实际时长同时受关节速度和加速度约束。
 
-当前大致原点附近，保持姿态水平向右后方 10 cm 的候选命令为：
+2026-11-27 的旧映射在当时记录的折叠姿态附近，保持姿态水平向右后方 10 cm 的候选命令为：
 
 ```bash
 ros2 run arm6_ros2 forward_line_test --bearing-deg=-105
@@ -400,6 +403,7 @@ ros2 run arm6_ros2 forward_line_test --bearing-deg=-105
 
 输出的位移来自编码器和模型推算，实物 100 mm 距离可用直尺另行核对。
 大致回原点不代表几何已标定；两个运动标定确认仍须按实测结果填写。
+旧编码映射的逆解失败可以用[保存的读数和离线复现命令](../../docs/hardware/README.md#离线复现直线逆解失败)核对。
 
 ## 8. 软件回归与当前边界
 

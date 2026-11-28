@@ -1,0 +1,133 @@
+/**:
+  ros__parameters:
+    device: /dev/ttyUSB0
+    baud_rate: 1000000
+    base_frame: arm6_calibrated
+    calibration_confirmed: true
+    geometry_confirmed: true
+    home_on_enable: false
+    home_confirmed: true
+    home_ticks:
+    - 3449
+    - 1227
+    - 1416
+    - 1117
+    - 1298
+    - 2525
+    home_arrival_tolerance_rad: 0.05235987755982989
+    calibration_jog_step_ticks: 20
+    motor_ids:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 4
+    - 11
+    - 12
+    expected_model_numbers:
+    - 1120
+    - 1120
+    - 1120
+    - 1000
+    - 1000
+    - 1000
+    - 1000
+    zero_ticks:
+    - 1971
+    - 977
+    - 2035
+    - 1045
+    - 1502
+    - 2555
+    joint_directions:
+    - 1
+    - 1
+    - -1
+    - 1
+    - -1
+    - 1
+    position_min_ticks:
+    - 0
+    - 740
+    - 1043
+    - 399
+    - 0
+    - 0
+    position_max_ticks:
+    - 4095
+    - 2700
+    - 3347
+    - 2560
+    - 4095
+    - 4095
+    dh_a_m:
+    - 0.0
+    - 0.0
+    - 0.2489377
+    - 7.7e-06
+    - 0.0
+    - 0.0
+    dh_d_m:
+    - 0.0495
+    - 0.0
+    - -0.011977
+    - 0.2905981
+    - 0.0
+    - 0.0735
+    dh_alpha_rad:
+    - 0.0
+    - 1.5707963267948966
+    - 0.0
+    - 1.5707963267948966
+    - 1.5707963267948966
+    - -1.5707963267948966
+    dh_offsets_rad:
+    - 0.0
+    - -0.08726646259971647
+    - 3.1590459461097367
+    - 3.141592653589793
+    - 0.0
+    - 0.0
+    tcp_xyz_m:
+    - 0.0
+    - 0.0
+    - 0.0
+    tcp_rpy_rad:
+    - 0.0
+    - 0.0
+    - 0.0
+    gripper_closed_ticks: 3180
+    gripper_open_ticks: 280
+    gripper_wraps_zero: true
+    gripper_max_width_m: 0.06
+    gripper_speed_m_s: 0.01
+    joint_velocity_limits_rad_s:
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.1
+    - 0.1
+    - 0.1
+    joint_acceleration_limits_rad_s2:
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.2
+    - 0.2
+    - 0.2
+    gripper_acceleration_m_s2: 0.02
+    profile_acceleration: 5
+    profile_velocity: 12
+    rate_hz: 30.0
+    feedback_timeout_s: 0.25
+    max_tracking_error_rad: 0.12
+    gripper_tracking_error_m: 0.006
+    arrival_tolerance_rad: 0.008
+    gripper_arrival_tolerance_m: 0.001
+    settle_time_s: 0.2
+    arrival_timeout_s: 5.0
+    cartesian_resolution_m: 0.001
+    cartesian_resolution_rad: 0.05
+    max_ik_joint_step_rad: 0.25
+    max_trajectory_duration_s: 300.0
+    max_waypoints: 2000
